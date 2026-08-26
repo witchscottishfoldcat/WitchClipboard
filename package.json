@@ -29,7 +29,7 @@
     "icons": "electron scripts/make-icons.cjs",
     "selftest": "cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast",
     "selftest:system-clipboard": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/system-clipboard-e2e.ps1",
-    "selftest:electron": "electron-vite build && electron out/main/index.js --self-test",
+    "selftest:electron": "npm run rebuild && electron-vite build && electron out/main/index.js --self-test",
     "rebuild": "electron-rebuild -f -w better-sqlite3-multiple-ciphers",
     "dist": "npm run dist:win",
     "dist:win": "tauri build --bundles nsis --target x86_64-pc-windows-msvc",

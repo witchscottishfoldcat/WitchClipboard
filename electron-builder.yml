@@ -20,6 +20,7 @@ files:
   # 托盘图标和窗口图标运行时要读，必须打进 asar
   # tray@2x.png 不是多余的：nativeImage 会按 @2x 约定自动挑高分屏那一张
   - resources/icon.png
+  - resources/icon.ico
   - resources/tray.png
   - resources/tray@2x.png
   # 原生模块的编译中间产物和测试扩展没必要跟着安装包走
@@ -34,7 +35,7 @@ asarUnpack:
   - '**/*.node'
 
 win:
-  icon: resources/icon.png
+  icon: resources/icon.ico
   target:
     - target: nsis
       arch: [x64, arm64]

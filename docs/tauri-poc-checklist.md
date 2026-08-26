@@ -2,6 +2,20 @@
 
 更新日期：2026-08-03
 
+## 2026-08-26 复验
+
+- [x] `npm ci --ignore-scripts` 后 TypeScript 类型检查通过
+- [x] Rust 自动测试 25 项通过，真实系统剪贴板 E2E 1 项通过
+- [x] Electron 回滚自检 100 项通过；自检现在会先重建匹配 Electron ABI 的 SQLite 原生模块
+- [x] `npm audit`：0 个已知漏洞
+- [x] Windows x64 NSIS 本地构建与隐藏启动 smoke 通过；正式 logo 在 150% DPI 下使用原生 SMALL 24×24 / BIG 48×48 帧，未额外缩小图案；产物为 3,492,472 bytes，SHA-256 `A005F6A86B13DBAE8C3877E643AC614F8D1FD5A9368F508CFD35F5683572BEC1`
+- [x] 10 次最终产物性能复验：隐藏态 14.18 MB / 2.66 MB，首次按需唤出 695.8 ms，热唤出 p50/p95 17.2/21.0 ms
+- [x] 最近一次远端 Tauri CI 成功，包含 x64 测试及原生 ARM64 构建、安装和启动 smoke
+- [ ] 正式签名 Release 工作流尚无运行记录；本机未配置 updater 私钥和 Authenticode 证书，不能以未签名本地产物替代
+
+本次复验发现并修复了干净安装后 Electron 自检缺少原生模块重建的问题，并更新锁文件消除依赖审计漏洞。
+签名发布、离线密钥备份以及 Electron 覆盖安装/回退仍属于下方维护者验收项。
+
 ## 已完成
 
 - [x] React UI 保持不变，默认 `dev`、`build`、`dist` 已切换到 Tauri

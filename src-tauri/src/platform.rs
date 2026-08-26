@@ -1,10 +1,11 @@
 #[cfg(windows)]
 mod imp {
     use std::{
+        collections::HashMap,
         ffi::c_void,
         path::Path,
         ptr::{null, null_mut},
-        sync::{mpsc, OnceLock},
+        sync::{mpsc, Mutex, OnceLock},
         thread,
         time::Duration,
     };
@@ -28,6 +29,7 @@ mod imp {
             },
         },
         UI::{
+            HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
             Input::KeyboardAndMouse::{
                 keybd_event, GetAsyncKeyState, KEYEVENTF_KEYUP, VK_CONTROL, VK_LWIN, VK_MENU,
                 VK_RWIN, VK_SHIFT,
@@ -36,8 +38,9 @@ mod imp {
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, MessageBoxW,
-                RegisterClassW, SetForegroundWindow, TranslateMessage, HWND_MESSAGE, MB_ICONERROR,
-                MB_OK, MSG, WM_CLIPBOARDUPDATE, WNDCLASSW,
+                PrivateExtractIconsW, RegisterClassW, SendMessageW, SetForegroundWindow,
+                TranslateMessage, HICON, HWND_MESSAGE, ICON_BIG, ICON_SMALL, MB_ICONERROR, MB_OK,
+                MSG, SM_CXICON, SM_CXSMICON, WM_CLIPBOARDUPDATE, WM_SETICON, WNDCLASSW,
             },
         },
     };
@@ -51,6 +54,10 @@ mod imp {
         "Clipboard Viewer Ignore",
     ];
     static CLIPBOARD_EVENTS: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+    // Store the extracted HICON handles for the process lifetime. Windows does not copy handles
+    // passed through WM_SETICON, so destroying them while a window is alive would leave it with
+    // dangling icons. The OS reclaims both handles when the process exits.
+    static WINDOW_ICONS: OnceLock<Mutex<HashMap<(i32, i32), (isize, isize)>>> = OnceLock::new();
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(Some(0)).collect()
@@ -67,6 +74,68 @@ mod imp {
                 MB_OK | MB_ICONERROR,
             );
         }
+    }
+
+    pub fn set_window_icons(window: &tauri::WebviewWindow) -> Result<(), String> {
+        let hwnd = window.hwnd().map_err(|error| error.to_string())?.0 as HWND;
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let large_size = unsafe { GetSystemMetricsForDpi(SM_CXICON, dpi) }.max(32);
+        let small_size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) }.max(16);
+        let cache = WINDOW_ICONS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .map_err(|_| "window icon cache lock poisoned".to_string())?;
+        let (large, small) = *cache.entry((large_size, small_size)).or_insert_with(|| {
+            let Ok(executable) = std::env::current_exe() else {
+                return (0, 0);
+            };
+            let path = wide(&executable.to_string_lossy());
+            let mut large: HICON = null_mut();
+            let mut small: HICON = null_mut();
+            let mut large_id = 0;
+            let mut small_id = 0;
+            // Extract exact per-monitor DPI sizes. In particular, Windows at 150% needs a
+            // native 48 px taskbar icon and 24 px small icon; scaling the 16 px ICO frame up to
+            // 24 px is visibly blurry.
+            let large_count = unsafe {
+                PrivateExtractIconsW(
+                    path.as_ptr(),
+                    0,
+                    large_size,
+                    large_size,
+                    &mut large,
+                    &mut large_id,
+                    1,
+                    0,
+                )
+            };
+            let small_count = unsafe {
+                PrivateExtractIconsW(
+                    path.as_ptr(),
+                    0,
+                    small_size,
+                    small_size,
+                    &mut small,
+                    &mut small_id,
+                    1,
+                    0,
+                )
+            };
+            if large_count == 0 || small_count == 0 {
+                (0, 0)
+            } else {
+                (large as isize, small as isize)
+            }
+        });
+        if large == 0 || small == 0 {
+            return Err("failed to extract embedded window icons".to_string());
+        }
+
+        unsafe {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as WPARAM, large as LPARAM);
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as WPARAM, small as LPARAM);
+        }
+        Ok(())
     }
 
     unsafe extern "system" fn clipboard_window_proc(
@@ -420,6 +489,9 @@ mod imp {
     }
     pub fn show_fatal_error(message: &str) {
         eprintln!("Witch Clipboard startup failed: {message}");
+    }
+    pub fn set_window_icons(_window: &tauri::WebviewWindow) -> Result<(), String> {
+        Ok(())
     }
 }
 

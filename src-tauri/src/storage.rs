@@ -7,6 +7,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, Row};
+#[cfg(test)]
 use serde::Serialize;
 use thiserror::Error;
 
@@ -75,6 +76,7 @@ pub enum StorageError {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub struct CompatibilityProbe {
     pub schema_version: i64,
     pub item_count: i64,
@@ -793,6 +795,7 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+#[cfg(test)]
 pub fn probe_existing(data_dir: &Path) -> Result<CompatibilityProbe, StorageError> {
     let keys = KeyMaterial::load_existing(data_dir)?;
     let connection = Connection::open_with_flags(

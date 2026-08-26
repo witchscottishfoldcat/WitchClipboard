@@ -346,6 +346,11 @@ fn watch_panel_window(window: &WebviewWindow) {
             api.prevent_close();
             hide_window(&watched);
         }
+        WindowEvent::Focused(true) => {
+            if let Err(error) = platform::set_window_icons(&watched) {
+                eprintln!("failed to refresh window icons: {error}");
+            }
+        }
         WindowEvent::Focused(false) if std::env::var_os("WCC_NO_AUTOHIDE").is_none() => {
             hide_window(&watched);
         }
@@ -370,6 +375,9 @@ fn show_existing_window(app: &AppHandle, label: &str) -> bool {
     }
     let _ = window.show();
     let _ = window.set_focus();
+    if let Err(error) = platform::set_window_icons(&window) {
+        eprintln!("failed to set window icons: {error}");
+    }
     let _ = app.emit("witchcat://panel-shown", ());
     let _ = app.emit("witchcat://changed", ());
     true

@@ -11,6 +11,9 @@ npm run dist:win
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\benchmark-tauri.ps1 -Iterations 10
 ```
 
+`selftest:electron` 会先按当前 Electron ABI 重建 SQLite 原生模块，因此上述流程在
+`npm ci --ignore-scripts` 的干净安装后也可以直接执行。
+
 所有运行时试验必须设置独立目录：
 
 ```powershell

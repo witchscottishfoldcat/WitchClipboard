@@ -183,11 +183,11 @@ Tauri updater 会验证发行产物的独立签名；Windows Authenticode 是否
 <p>
   <img src="resources/icon-256.png" width="96" alt="主图标" />
   &nbsp;&nbsp;
-  <img src="resources/tray@2x.png" width="64" alt="托盘图标（简化版）" />
+  <img src="resources/tray@2x.png" width="64" alt="托盘图标" />
 </p>
 
-左边是主图标，右边是托盘专用的简化版。图标沿用 WitchDrawer 的暖金底色、
-深紫粗描边和轻立体边框，主体改为“巫师帽 + 剪贴板”。
+左边是主图标，右边是同一图标的托盘尺寸版本。图标采用暖金底色、
+深紫粗描边和轻立体边框，主体为“巫师帽 + 剪贴板”。
 
 | | |
 | --- | --- |
@@ -199,9 +199,9 @@ Tauri updater 会验证发行产物的独立签名；Windows Authenticode 是否
 
 | 文件 | 用途 |
 | --- | --- |
-| `resources/logo-rendered.png` | 正式光栅母版：基于 WitchDrawer 原图改造，保留材质、光影和描边质感 |
+| `resources/logo-rendered.png` | 正式光栅母版，应用内与各平台图标均从它派生 |
 | `resources/logo.svg` / `logo-tray.svg` | 早期矢量草稿，仅作为设计记录保留 |
-| `resources/icon.png` / `icon-256.png` | 应用图标、安装包图标、README |
+| `resources/icon.png` / `icon-256.png` / `icon.ico` | 应用图标、Windows 安装包图标、README |
 | `resources/tray.png` / `tray@2x.png` | 同一母版生成的托盘图标（`nativeImage` 按 `@2x` 约定自动挑高分屏版本） |
 
 替换母版后跑 `npm run icons` 重新生成；正式应用不会携带浏览器运行时。

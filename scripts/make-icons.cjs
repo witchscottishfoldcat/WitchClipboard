@@ -1,7 +1,7 @@
 /**
  * 图标生成：高保真 PNG 是设计母版，各尺寸都由它统一缩放生成。
  *
- * 用 Electron（Chromium）渲染 SVG——它本来就在依赖里，不用再引 sharp/resvg 这类
+ * 用 Electron（Chromium）缩放 PNG——它本来就在依赖里，不用再引 sharp/resvg 这类
  * 需要编译的依赖。画到 canvas 再取 toDataURL，拿到的是真正带 alpha 的位图，
  * 不受窗口透明度设置影响。
  *
@@ -21,9 +21,8 @@ const JOBS = [
   ['logo-rendered.png', 'tray@2x.png', 64],
 ]
 
-// 母版四周有约 9% 的透明留白。输出时只裁掉外侧 6%，
-// 不改变帽子、剪贴板和内容线之间的内部比例，同时保留约 3% 安全边距。
-const OUTER_CROP_RATIO = 0.06
+// 新母版的帽子、底板和边框已经贴合画布，额外裁边会破坏完整轮廓。
+const OUTER_CROP_RATIO = 0
 
 async function rasterize(win, sourcePath, size) {
   const source = readFileSync(join(RES, sourcePath))
@@ -73,9 +72,9 @@ app
     mkdirSync(RES, { recursive: true })
     let failed = 0
 
-    for (const [svgPath, out, size] of JOBS) {
+    for (const [sourcePath, out, size] of JOBS) {
       try {
-        const png = await rasterize(win, svgPath, size)
+        const png = await rasterize(win, sourcePath, size)
         writeFileSync(join(RES, out), png)
         console.log(`✓ resources/${out}  ${size}x${size}  ${(png.byteLength / 1024).toFixed(1)} KB`)
       } catch (err) {
