@@ -40,34 +40,10 @@ jobs:
           WCC_UPDATER_PUBLIC_KEY: ${{ vars.WCC_UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:WCC_UPDATER_PUBLIC_KEY)) { throw 'Missing WCC_UPDATER_PUBLIC_KEY repository variable' }
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw 'Missing TAURI_SIGNING_PRIVATE_KEY secret' }
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) { throw 'Missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret' }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) { throw 'Missing WINDOWS_CERTIFICATE secret (base64 PFX)' }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) { throw 'Missing WINDOWS_CERTIFICATE_PASSWORD secret' }
-      - name: Import Authenticode certificate
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: |
-          $pfxPath = Join-Path $env:RUNNER_TEMP 'witch-clipboard-code-signing.pfx'
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
-          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
-          if (-not $certificate.Thumbprint) { throw 'Authenticode certificate import returned no thumbprint' }
-          @{
-            bundle = @{
-              windows = @{
-                certificateThumbprint = $certificate.Thumbprint
-                digestAlgorithm = 'sha256'
-                timestampUrl = 'http://timestamp.digicert.com'
-              }
-            }
-          } | ConvertTo-Json -Depth 5 | Set-Content src-tauri/tauri.signing.conf.json -Encoding utf8
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,7 +56,9 @@ jobs:
           releaseDraft: true
           generateReleaseNotes: true
           updaterJsonPreferNsis: true
-          args: --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.signing.conf.json
+          # Public release is intentionally Authenticode-unsigned for now. The Tauri updater
+          # artifacts remain signed with the existing updater key above.
+          args: --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
       - name: Build portable package
         shell: pwsh
         run: |

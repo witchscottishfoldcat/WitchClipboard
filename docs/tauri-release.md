@@ -35,18 +35,13 @@ npm run selftest:system-clipboard
 2. 私钥及密码分别进入 GitHub secrets：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
 3. 公钥进入 GitHub repository variable：`WCC_UPDATER_PUBLIC_KEY`。
 4. 私钥原件必须离线备份；后续不可重新生成替代，否则已安装客户端无法验证新更新。
-5. 推送 `app-v<version>` tag 后，工作流构建 x64/ARM64 NSIS、签名并生成 `latest.json` 草稿发布。
+5. 推送 `app-v<version>` tag 后，工作流构建 x64/ARM64 NSIS，并使用 updater 密钥生成 `latest.json` 草稿发布。
 
-## Windows Authenticode 证书
+## Windows Authenticode 证书（暂不启用）
 
-Tauri updater 签名只负责证明更新包未被替换，不能消除 SmartScreen。正式发布还必须配置：
-
-- `WINDOWS_CERTIFICATE`：代码签名 PFX 文件的 base64 内容。
-- `WINDOWS_CERTIFICATE_PASSWORD`：PFX 密码。
-
-发布工作流会把证书导入 runner 的当前用户证书库，动态写入不受版本控制的
-`src-tauri/tauri.signing.conf.json`，并为 EXE/NSIS 使用 SHA-256 和可信时间戳。缺少证书时工作流
-必须失败，禁止发布一个被误称为“已签名”的安装包。
+当前公开发布暂不配置 Windows Authenticode 证书，因此 EXE/NSIS 安装包可能触发 SmartScreen
+提示。Tauri updater 签名仍然启用，只负责证明更新包未被替换，不能消除 SmartScreen。
+后续如果配置 PFX 或 Azure Artifact Signing，再把 Authenticode 签名步骤加入发布工作流。
 
 普通 `main` 推送会在全新的 `windows-11-arm` 原生 ARM64 runner 上运行 Rust 测试、构建未签名
 ARM64 NSIS，并静默安装后启动 8 秒做 smoke test；产物只作为 CI artifact，不得公开发行。
