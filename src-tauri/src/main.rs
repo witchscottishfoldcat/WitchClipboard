@@ -21,7 +21,7 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-    WindowEvent,
+    PhysicalPosition, Rect, WindowEvent,
 };
 use tauri_plugin_global_shortcut::Shortcut;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -358,7 +358,43 @@ fn watch_panel_window(window: &WebviewWindow) {
     });
 }
 
-fn show_existing_window(app: &AppHandle, label: &str) -> bool {
+fn position_mini_near_tray(window: &WebviewWindow, tray_rect: &Rect) {
+    let scale_factor = window.scale_factor().unwrap_or(1.0);
+    let tray_position = tray_rect.position.to_physical::<i32>(scale_factor);
+    let tray_size = tray_rect.size.to_physical::<u32>(scale_factor);
+    let Ok(window_size) = window.inner_size() else {
+        return;
+    };
+
+    let monitor = window
+        .available_monitors()
+        .ok()
+        .and_then(|monitors| {
+            monitors.into_iter().find(|monitor| {
+                let area = monitor.work_area();
+                tray_position.x >= area.position.x
+                    && tray_position.x < area.position.x + area.size.width as i32
+                    && tray_position.y >= area.position.y
+                    && tray_position.y < area.position.y + area.size.height as i32
+            })
+        })
+        .or_else(|| window.current_monitor().ok().flatten());
+    let Some(monitor) = monitor else {
+        return;
+    };
+
+    let area = monitor.work_area();
+    let margin = 8;
+    let max_x = area.position.x + area.size.width as i32 - window_size.width as i32 - margin;
+    let max_y = area.position.y + area.size.height as i32 - window_size.height as i32 - margin;
+    let x = (tray_position.x + tray_size.width as i32 - window_size.width as i32)
+        .clamp(area.position.x + margin, max_x);
+    let y = (tray_position.y - window_size.height as i32 - margin)
+        .clamp(area.position.y + margin, max_y);
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+}
+
+fn show_existing_window(app: &AppHandle, label: &str, tray_rect: Option<&Rect>) -> bool {
     let Some(window) = app.get_webview_window(label) else {
         return false;
     };
@@ -373,6 +409,11 @@ fn show_existing_window(app: &AppHandle, label: &str) -> bool {
             }
         }
     }
+    if label == "mini" {
+        if let Some(tray_rect) = tray_rect {
+            position_mini_near_tray(&window, tray_rect);
+        }
+    }
     let _ = window.show();
     let _ = window.set_focus();
     if let Err(error) = platform::set_window_icons(&window) {
@@ -383,8 +424,8 @@ fn show_existing_window(app: &AppHandle, label: &str) -> bool {
     true
 }
 
-fn show_mini_window(app: &AppHandle) {
-    if show_existing_window(app, "mini") {
+fn show_mini_window(app: &AppHandle, tray_rect: Option<Rect>) {
+    if show_existing_window(app, "mini", tray_rect.as_ref()) {
         return;
     }
     remember_paste_target(app);
@@ -396,10 +437,10 @@ fn show_mini_window(app: &AppHandle) {
             WebviewUrl::App("index.html?mode=mini".into()),
         )
         .title("Witch Clipboard")
-        .inner_size(340.0, 470.0)
-        .center()
+        .inner_size(280.0, 390.0)
         .decorations(false)
         .transparent(true)
+        .shadow(false)
         .resizable(false)
         .skip_taskbar(true)
         .always_on_top(true)
@@ -408,7 +449,12 @@ fn show_mini_window(app: &AppHandle) {
         match built {
             Ok(window) => {
                 watch_panel_window(&window);
-                let _ = show_existing_window(&handle, "mini");
+                if let Some(tray_rect) = tray_rect.as_ref() {
+                    position_mini_near_tray(&window, tray_rect);
+                } else {
+                    let _ = window.center();
+                }
+                let _ = show_existing_window(&handle, "mini", tray_rect.as_ref());
             }
             Err(error) => eprintln!("failed to create mini panel: {error}"),
         }
@@ -416,7 +462,7 @@ fn show_mini_window(app: &AppHandle) {
 }
 
 fn show_main_window(app: &AppHandle) {
-    if show_existing_window(app, "main") {
+    if show_existing_window(app, "main", None) {
         return;
     }
     remember_paste_target(app);
@@ -430,6 +476,7 @@ fn show_main_window(app: &AppHandle) {
                 .center()
                 .decorations(false)
                 .transparent(true)
+                .shadow(false)
                 .resizable(true)
                 .skip_taskbar(true)
                 .always_on_top(true)
@@ -438,7 +485,7 @@ fn show_main_window(app: &AppHandle) {
         match built {
             Ok(window) => {
                 watch_panel_window(&window);
-                let _ = show_existing_window(&handle, "main");
+                let _ = show_existing_window(&handle, "main", None);
             }
             Err(error) => eprintln!("failed to create main panel: {error}"),
         }
@@ -455,7 +502,7 @@ fn toggle_main_window(app: &AppHandle) {
     show_main_window(app);
 }
 
-fn toggle_tray_window(app: &AppHandle) {
+fn toggle_tray_window(app: &AppHandle, tray_rect: Option<Rect>) {
     let state = app.state::<Arc<AppState>>();
     if epoch_ms() - state.hidden_at.load(Ordering::Acquire) < 400 {
         return;
@@ -472,7 +519,7 @@ fn toggle_tray_window(app: &AppHandle) {
         }
     }
     if label == "mini" {
-        show_mini_window(app);
+        show_mini_window(app, tray_rect);
     } else {
         show_main_window(app);
     }
@@ -637,8 +684,8 @@ fn save_settings(
             .store
             .prune(next.max_items, next.max_days)
             .map_err(|error| error.to_string())?;
-        let _ = app.emit("witchcat://changed", ());
     }
+    let _ = app.emit("witchcat://changed", ());
     Ok(next)
 }
 
@@ -833,13 +880,17 @@ async fn webdav_sync_now(
 }
 
 #[tauri::command]
-fn toggle_pin(state: State<'_, Arc<AppState>>, id: i64) {
-    let _ = state.store.toggle_pin(id);
+fn toggle_pin(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    state.store.toggle_pin(id).map_err(|error| error.to_string())?;
+    let _ = app.emit("witchcat://changed", ());
+    Ok(())
 }
 
 #[tauri::command]
-fn remove_item(state: State<'_, Arc<AppState>>, id: i64) {
-    let _ = state.store.remove(id);
+fn remove_item(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    state.store.remove(id).map_err(|error| error.to_string())?;
+    let _ = app.emit("witchcat://changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1031,7 +1082,7 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => toggle_tray_window(app),
+                    "show" => toggle_tray_window(app, None),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -1039,10 +1090,11 @@ fn main() {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        rect,
                         ..
                     } = event
                     {
-                        toggle_tray_window(tray.app_handle());
+                        toggle_tray_window(tray.app_handle(), Some(rect));
                     }
                 })
                 .build(app)?;

@@ -147,8 +147,9 @@ export function registerIpc(deps: IpcDeps): void {
     }
 
     if (next.maxItems !== before.maxItems || next.maxDays !== before.maxDays) {
-      if (sweep(store) > 0) broadcast('items:changed')
+      sweep(store)
     }
+    broadcast('items:changed')
     return next
   })
 

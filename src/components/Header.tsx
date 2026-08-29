@@ -25,7 +25,7 @@ export function Header({
 }: Props) {
   return (
     <div className="drag-region flex items-center gap-3 px-3.5 pt-3 pb-2.5">
-      <Logo className="no-drag size-8 shrink-0 overflow-hidden rounded-[6px] bg-white p-[2px] shadow-md shadow-black/15 ring-1 ring-black/5 dark:shadow-black/30 dark:ring-white/15" />
+      <Logo className="no-drag size-8 shrink-0 overflow-hidden rounded-[6px] bg-white p-[2px] shadow-md shadow-black/15 ring-1 ring-black/5 dark:bg-[#2b2735] dark:shadow-black/30 dark:ring-white/10" />
 
       <div className="no-drag group relative flex-1">
         <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-black/35 dark:text-white/35" />

@@ -147,7 +147,7 @@ export default function MiniApp() {
     <div className="panel-surface relative flex h-full flex-col overflow-hidden text-black dark:text-white">
       {/* 顶栏：可拖动，右侧是展开和关闭 */}
       <div className="drag-region flex items-center gap-2 px-2.5 pt-2.5 pb-1.5">
-        <Logo className="no-drag size-6 shrink-0 overflow-hidden rounded-[5px] bg-white p-[1.5px] shadow-sm shadow-black/12 ring-1 ring-black/5 dark:shadow-black/25 dark:ring-white/15" />
+        <Logo className="no-drag size-6 shrink-0 overflow-hidden rounded-[5px] bg-white p-[1.5px] shadow-sm shadow-black/12 ring-1 ring-black/5 dark:bg-[#2b2735] dark:shadow-black/25 dark:ring-white/10" />
 
         {searching ? (
           <div className="no-drag relative flex-1">

@@ -28,7 +28,7 @@
 | | |
 | --- | --- |
 | **自动采集** | 文字、图片（截图）、文件都自动入库；同一内容重复复制只上浮不重复存 |
-| **两种面板** | 单击托盘出迷你预览（340×470），`Alt+V` 出完整面板（820×540） |
+| **两种面板** | 单击托盘出迷你预览（280×390），`Alt+V` 出完整面板（820×540） |
 | **自动分类** | 文字 / 图片 / 文件 / 链接 / Key / 模型 / 代码 / 颜色 / 路径 / 邮箱 / 数字，各有徽标 |
 | **来源搜索** | 搜索内容的同时可按来源程序检索，例如输入 `msedge` 只看浏览器复制记录 |
 | **关联配置** | 5 秒内连续复制的模型名、Key、接口地址等自动归为一组，最多展示 5 条，可一键收起 |
@@ -50,6 +50,7 @@
 
 - Windows x64：`Witch-Clipboard-<版本>-x64-setup.exe`
 - Windows ARM64：`Witch-Clipboard-<版本>-arm64-setup.exe`（实验性）
+- Windows x64/ARM64 便携版：`Witch-Clipboard-<版本>-<架构>-portable.zip`（解压即用）
 
 Windows 安装包使用 NSIS，可选安装位置，卸载不删除数据。正式发行只面向 Windows，
 自己构建的产物在 `src-tauri/target/<target>/release/bundle/nsis/` 下。
@@ -66,6 +67,8 @@ npm run build        # 构建 Tauri 应用
 npm run dist         # Windows x64 NSIS 安装包
 npm run dist:win:arm64
 npm run dist:win:all # 同时构建 Windows x64 / ARM64
+npm run dist:win:portable # Windows x64 便携版
+npm run dist:win:arm64:portable # Windows ARM64 便携版
 npm run icons        # 重新生成图标
 ```
 
@@ -92,7 +95,7 @@ Windows x64 是主支持平台；Windows ARM64 目前属于实验性构建。
 
 ## 两个面板
 
-- **迷你预览面板**（单击托盘）：340×470，一屏能扫到最近 8 条左右。文字看首行、图片看缩略图、
+- **迷你预览面板**（单击托盘）：280×390，一屏能扫到最近 8 条左右。文字看首行、图片看缩略图、
   文件看名字 + 大小 + 所在目录。直接打字即搜索，`↑↓` 选择，`Enter` / 双击粘贴；全局快粘键默认
   `Ctrl+Alt+1…9`，修饰键可在设置中修改，
   右上角箭头展开成完整面板。

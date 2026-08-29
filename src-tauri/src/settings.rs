@@ -69,6 +69,17 @@ fn merge_settings(value: Value) -> Settings {
         .retain(|filter| !filter.trim().is_empty() && filter != "all");
     settings.visible_filters.insert(0, "all".to_string());
     settings.visible_filters.dedup();
+    let mut optional_count = 0;
+    settings.visible_filters.retain(|filter| {
+        if filter == "all" {
+            true
+        } else if optional_count < 5 {
+            optional_count += 1;
+            true
+        } else {
+            false
+        }
+    });
     settings
 }
 
@@ -99,6 +110,17 @@ mod tests {
         assert_eq!(
             merge_settings(serde_json::json!({ "opacity": 255 })).opacity,
             100
+        );
+    }
+
+    #[test]
+    fn visible_filters_are_limited_to_five_optional_filters() {
+        let settings = merge_settings(serde_json::json!({
+            "visibleFilters": ["text", "image", "files", "url", "key", "model"]
+        }));
+        assert_eq!(
+            settings.visible_filters,
+            ["all", "text", "image", "files", "url", "key"]
         );
     }
 }

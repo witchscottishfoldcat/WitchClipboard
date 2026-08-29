@@ -27,6 +27,12 @@ html[data-theme='dark'] {
 .panel-surface {
   background-color: rgb(var(--panel-background-rgb) / var(--panel-background-opacity));
   backdrop-filter: blur(24px);
+  border: 1px solid rgb(0 0 0 / 0.14);
+  border-radius: var(--radius-panel);
+}
+
+html[data-theme='dark'] .panel-surface {
+  border-color: rgb(255 255 255 / 0.12);
 }
 
 /* 统一按钮调色盘：Tailwind 的 brand-* 工具类最终都读取这些变量 */

@@ -1,6 +1,6 @@
 {
   "name": "witch-clipboard",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "license": "CC-BY-NC-SA-4.0",
   "description": "Witch Clipboard — 本地优先的剪贴板管理器：自动分类、来源搜索、关联配置、加密存储与局域网跨设备同步。",
@@ -37,6 +37,8 @@
     "dist:win:all": "npm run dist:win && npm run dist:win:arm64",
     "dist:win:release": "tauri build --bundles nsis --target x86_64-pc-windows-msvc --config src-tauri/tauri.release.conf.json",
     "dist:win:arm64:release": "tauri build --bundles nsis --target aarch64-pc-windows-msvc --config src-tauri/tauri.release.conf.json",
+    "dist:win:portable": "tauri build --no-bundle --target x86_64-pc-windows-msvc && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1 -Architecture x64",
+    "dist:win:arm64:portable": "tauri build --no-bundle --target aarch64-pc-windows-msvc && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1 -Architecture arm64",
     "dist:electron:win": "electron-vite build && electron-builder --win nsis --x64",
     "dist:electron:win:arm64": "electron-vite build && electron-builder --win nsis --arm64",
     "dist:electron:mac": "electron-vite build && electron-builder --mac dmg zip --x64 --arm64",

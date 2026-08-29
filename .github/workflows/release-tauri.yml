@@ -81,3 +81,18 @@ jobs:
           generateReleaseNotes: true
           updaterJsonPreferNsis: true
           args: --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.signing.conf.json
+      - name: Build portable package
+        shell: pwsh
+        run: |
+          npx tauri build --ci --no-sign --no-bundle --target ${{ matrix.target }}
+          $architecture = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'arm64' } else { 'x64' }
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1 -Architecture $architecture
+      - name: Upload portable package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content -Raw -Encoding UTF8 package.json | ConvertFrom-Json).version
+          $architecture = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'arm64' } else { 'x64' }
+          $asset = "release/Witch-Clipboard-$version-$architecture-portable.zip"
+          gh release upload "app-v$version" $asset --clobber

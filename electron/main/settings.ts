@@ -1,7 +1,7 @@
 import { app } from 'electron'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import type { Settings } from '@shared/types'
+import type { FilterId, Settings } from '@shared/types'
 
 const DEFAULTS: Settings = {
   hotkey: 'Alt+V',
@@ -30,11 +30,19 @@ const DEFAULTS: Settings = {
   skippedVersion: null,
 }
 const ACCENTS: Settings['accent'][] = ['violet', 'blue', 'cyan', 'teal', 'green', 'amber', 'rose']
+const MAX_VISIBLE_FILTERS = 5
 
 function normalizeOpacity(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value)
     ? Math.min(100, Math.max(20, Math.round(value)))
     : DEFAULTS.opacity
+}
+
+function normalizeVisibleFilters(value: unknown): Settings['visibleFilters'] {
+  const ids = Array.isArray(value)
+    ? value.filter((id): id is FilterId => typeof id === 'string')
+    : []
+  return ['all', ...ids.filter((id) => id !== 'all').slice(0, MAX_VISIBLE_FILTERS)]
 }
 
 let cache: Settings | null = null
@@ -52,10 +60,11 @@ export function getSettings(): Settings {
     cache = {
       ...DEFAULTS,
       ...raw,
-      visibleFilters:
+      visibleFilters: normalizeVisibleFilters(
         Array.isArray(raw.visibleFilters) && raw.visibleFilters.length > 0
-          ? ['all', ...raw.visibleFilters.filter((id) => id !== 'all')]
+          ? raw.visibleFilters
           : DEFAULTS.visibleFilters,
+      ),
       accent: raw.accent && ACCENTS.includes(raw.accent) ? raw.accent : DEFAULTS.accent,
       opacity: normalizeOpacity(raw.opacity),
     }

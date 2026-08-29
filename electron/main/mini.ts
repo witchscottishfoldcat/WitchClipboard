@@ -8,8 +8,8 @@ import { rememberForegroundWindow } from './paste'
 import { autoHideDisabled, claimForeground, watchOutsideClick } from './dismiss'
 import { isQuitting, type AnchorRect } from './window'
 
-const MINI_W = 340
-const MINI_H = 470
+const MINI_W = 280
+const MINI_H = 390
 const IDLE_RELEASE_MS = 60_000
 const isDev = !app.isPackaged
 
@@ -32,6 +32,7 @@ export function createMini(): BrowserWindow {
     show: false,
     frame: true,
     titleBarStyle: 'hidden',
+    hasShadow: false,
     backgroundColor: '#00000000',
     backgroundMaterial: 'acrylic',
     skipTaskbar: true,

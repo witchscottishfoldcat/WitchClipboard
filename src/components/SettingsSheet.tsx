@@ -44,6 +44,7 @@ const THEMES: [Settings['theme'], string, typeof Monitor][] = [
 
 const ITEM_LIMITS = [500, 2000, 10000, 0]
 const DAY_LIMITS = [7, 30, 90, 0]
+const MAX_VISIBLE_FILTERS = 5
 const QUICK_MODIFIERS = [
   ['Ctrl', 'Ctrl'],
   ['Alt', 'Alt'],
@@ -179,8 +180,16 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
   const toggleVisibleFilter = (filterId: FilterId): void => {
     if (!settings || filterId === 'all') return
     const selected = new Set(settings.visibleFilters)
-    if (selected.has(filterId)) selected.delete(filterId)
-    else selected.add(filterId)
+    if (selected.has(filterId)) {
+      selected.delete(filterId)
+    } else {
+      const selectedOptionalCount = [...selected].filter((id) => id !== 'all').length
+      if (selectedOptionalCount >= MAX_VISIBLE_FILTERS) {
+        onToast(`导航栏标签最多选择 ${MAX_VISIBLE_FILTERS} 个`, 'warn')
+        return
+      }
+      selected.add(filterId)
+    }
     const ordered = KIND_FILTERS.map((filter) => filter.id).filter(
       (id) => id === 'all' || selected.has(id),
     )
@@ -409,15 +418,21 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
             <div className="flex flex-wrap gap-1.5 rounded-xl bg-black/[0.035] p-2 dark:bg-white/[0.055]">
               {OPTIONAL_FILTERS.map((filter) => {
                 const active = settings?.visibleFilters.includes(filter.id) ?? false
+                const selectedOptionalCount =
+                  settings?.visibleFilters.filter((id) => id !== 'all').length ?? 0
+                const atLimit = !active && selectedOptionalCount >= MAX_VISIBLE_FILTERS
                 return (
                   <button
                     key={filter.id}
                     type="button"
                     onClick={() => toggleVisibleFilter(filter.id)}
+                    title={atLimit ? `最多选择 ${MAX_VISIBLE_FILTERS} 个标签` : undefined}
                     className={`h-7 rounded-lg px-2.5 text-[10.5px] transition ${
                       active
                         ? 'bg-brand-500 text-white shadow-sm shadow-brand-500/25'
-                        : 'bg-white/70 text-black/45 hover:bg-white dark:bg-white/7 dark:text-white/45 dark:hover:bg-white/12'
+                        : atLimit
+                          ? 'cursor-not-allowed bg-white/45 text-black/25 dark:bg-white/5 dark:text-white/25'
+                          : 'bg-white/70 text-black/45 hover:bg-white dark:bg-white/7 dark:text-white/45 dark:hover:bg-white/12'
                     }`}
                   >
                     {filter.label}
@@ -426,7 +441,7 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
               })}
             </div>
             <div className="text-[10px] leading-4 text-black/35 dark:text-white/35">
-              可选分类：文字、图片、文件、链接、Key、模型、代码、颜色、路径、邮箱和数字。
+              最多选择 {MAX_VISIBLE_FILTERS} 个；可选分类：文字、图片、文件、链接、Key、模型、代码、颜色、路径、邮箱和数字。
             </div>
           </section>
 

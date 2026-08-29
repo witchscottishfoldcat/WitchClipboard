@@ -9,10 +9,21 @@ export function useTheme(): 'light' | 'dark' {
   const [resolved, setResolved] = useState<'light' | 'dark'>('dark')
 
   useEffect(() => {
-    void api.getSettings().then((s) => {
-      setPref(s.theme)
-      applyAccent(s.accent)
-    })
+    let disposed = false
+    const sync = (): void => {
+      void api.getSettings().then((s) => {
+        if (disposed) return
+        setPref(s.theme)
+        applyAccent(s.accent)
+      })
+    }
+
+    sync()
+    const unsubscribe = api.onChanged(sync)
+    return () => {
+      disposed = true
+      unsubscribe()
+    }
   }, [])
 
   useEffect(() => {
