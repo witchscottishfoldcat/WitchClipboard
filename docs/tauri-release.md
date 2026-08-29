@@ -29,18 +29,15 @@ npm run selftest:system-clipboard
 
 该测试覆盖 HTML、图片和 `CF_HDROP` 文件列表从系统剪贴板进入加密历史、再写回系统剪贴板的完整 Rust 链路。
 
-## updater 密钥（只做一次）
+## updater 密钥（暂不启用）
 
-1. 由发布负责人执行 `npx tauri signer generate -w <安全位置>` 并设置强密码。
-2. 私钥及密码分别进入 GitHub secrets：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
-3. 公钥进入 GitHub repository variable：`WCC_UPDATER_PUBLIC_KEY`。
-4. 私钥原件必须离线备份；后续不可重新生成替代，否则已安装客户端无法验证新更新。
-5. 推送 `app-v<version>` tag 后，工作流构建 x64/ARM64 NSIS，并使用 updater 密钥生成 `latest.json` 草稿发布。
+当前发布流程暂不生成 updater 签名文件，也不要求 GitHub 配置 updater 密钥。
+推送 `app-v<version>` tag 后，工作流直接构建未签名的 x64/ARM64 NSIS 和便携版 ZIP。
 
 ## Windows Authenticode 证书（暂不启用）
 
 当前公开发布暂不配置 Windows Authenticode 证书，因此 EXE/NSIS 安装包可能触发 SmartScreen
-提示。Tauri updater 签名仍然启用，只负责证明更新包未被替换，不能消除 SmartScreen。
+提示，也不会生成 updater 签名文件。
 后续如果配置 PFX 或 Azure Artifact Signing，再把 Authenticode 签名步骤加入发布工作流。
 
 普通 `main` 推送会在全新的 `windows-11-arm` 原生 ARM64 runner 上运行 Rust 测试、构建未签名

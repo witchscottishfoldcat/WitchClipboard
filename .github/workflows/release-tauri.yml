@@ -34,30 +34,16 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install dependencies
         run: npm ci --ignore-scripts
-      - name: Validate updater signing configuration
-        shell: pwsh
-        env:
-          WCC_UPDATER_PUBLIC_KEY: ${{ vars.WCC_UPDATER_PUBLIC_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:WCC_UPDATER_PUBLIC_KEY)) { throw 'Missing WCC_UPDATER_PUBLIC_KEY repository variable' }
-          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw 'Missing TAURI_SIGNING_PRIVATE_KEY secret' }
-          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) { throw 'Missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret' }
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WCC_UPDATER_PUBLIC_KEY: ${{ vars.WCC_UPDATER_PUBLIC_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: app-v__VERSION__
           releaseName: Witch Clipboard __VERSION__
           releaseDraft: true
           generateReleaseNotes: true
           updaterJsonPreferNsis: true
-          # Public release is intentionally Authenticode-unsigned for now. The Tauri updater
-          # artifacts remain signed with the existing updater key above.
+          # Public release is intentionally unsigned for now.
           args: --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
       - name: Build portable package
         shell: pwsh
