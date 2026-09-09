@@ -41,6 +41,7 @@ use storage::{NewItem, SqliteStore};
 
 const HIDDEN_RESTART_MARKER: &str = ".restart-hidden";
 const MAIN_TOGGLE_DEBOUNCE_MS: i64 = 300;
+const MINI_HOTKEY: &str = "Alt+M";
 
 struct AppState {
     store: SqliteStore,
@@ -337,6 +338,11 @@ fn hide_window(window: &WebviewWindow) {
                 )
                 .is_ok()
             {
+                if spawn_detached_restart(&state.store.data_dir().join("restart-helper.log")) {
+                    // 旧进程必须先退出、释放单实例句柄，助手再拉起新实例；
+                    // 直接 request_restart 会 spawn 出一个被单实例插件判定重复而自杀的新实例。
+                    std::process::exit(0);
+                }
                 handle.request_restart();
             }
         }
@@ -515,6 +521,70 @@ fn show_main_window(app: &AppHandle) {
     });
 }
 
+#[cfg(windows)]
+fn spawn_detached_restart(log_path: &std::path::Path) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        let _ = std::fs::write(log_path, "current_exe unavailable\n");
+        return false;
+    };
+    // 必须等旧进程完全退出再拉起新实例：WebView2 清理可能让进程在 exit(0) 后
+    // 仍存活数秒，过早启动的新实例会被单实例插件判定为重复启动而自行退出，
+    // 表现为“应用莫名关闭”。
+    let script = format!(
+        "while (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }}; \
+         Start-Process -FilePath '{}'; \
+         Add-Content -LiteralPath '{}' -Value ('relaunched ' + (Get-Date -Format HH:mm:ss))",
+        std::process::id(),
+        exe.display(),
+        log_path.display()
+    );
+    // 用绝对路径调用，避免应用环境缺少 PATH 时 spawn 失败
+    let powershell = std::env::var_os("SystemRoot").map_or_else(
+        || std::path::PathBuf::from("powershell.exe"),
+        |root| {
+            std::path::Path::new(&root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        },
+    );
+    use std::os::windows::process::CommandExt;
+    // WebView2 会把宿主进程加入 Job Object，宿主退出时子进程会被一并终止；
+    // 先尝试 CREATE_BREAKAWAY_FROM_JOB 逃逸，失败再退回普通方式。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let mut outcome = String::new();
+    for (attempt, flags) in [
+        ("breakaway", CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB),
+        ("plain", CREATE_NO_WINDOW),
+    ] {
+        match std::process::Command::new(&powershell)
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .creation_flags(flags)
+            .spawn()
+        {
+            Ok(child) => {
+                let _ = std::fs::write(
+                    log_path,
+                    format!("helper pid={} mode={attempt}\n", child.id()),
+                );
+                return true;
+            }
+            Err(error) => {
+                outcome.push_str(&format!("{attempt}: {error}\n"));
+            }
+        }
+    }
+    let _ = std::fs::write(log_path, format!("spawn failed\n{outcome}"));
+    false
+}
+
+#[cfg(not(windows))]
+fn spawn_detached_restart() -> bool {
+    false
+}
+
 fn toggle_main_window(app: &AppHandle) {
     let state = app.state::<Arc<AppState>>();
     let now = epoch_ms();
@@ -529,6 +599,17 @@ fn toggle_main_window(app: &AppHandle) {
         }
     }
     show_main_window(app);
+}
+
+fn toggle_mini_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("mini") {
+        if window.is_visible().unwrap_or(false) {
+            hide_window(&window);
+            return;
+        }
+    }
+    remember_paste_target(app);
+    show_mini_window(app, None);
 }
 
 fn toggle_tray_window(app: &AppHandle, tray_rect: Option<Rect>) {
@@ -585,6 +666,10 @@ fn register_shortcuts(
         Err(error) => return Err(error.to_string()),
     };
     state.main_shortcut_id.store(main.id(), Ordering::Release);
+    if let Ok(mini) = MINI_HOTKEY.parse::<Shortcut>() {
+        // 与快速粘贴快捷键一致：注册失败不阻塞主热键
+        app.global_shortcut().register(mini).ok();
+    }
     let mut quick = state
         .quick_shortcuts
         .lock()
@@ -606,6 +691,12 @@ fn handle_shortcut(app: &AppHandle, shortcut: &Shortcut) {
     if shortcut.id() == state.main_shortcut_id.load(Ordering::Acquire) {
         toggle_main_window(app);
         return;
+    }
+    if let Ok(mini) = MINI_HOTKEY.parse::<Shortcut>() {
+        if shortcut.id() == mini.id() {
+            toggle_mini_window(app);
+            return;
+        }
     }
     let index = state
         .quick_shortcuts
