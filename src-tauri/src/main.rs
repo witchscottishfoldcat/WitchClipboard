@@ -6,7 +6,7 @@ use std::{
     io::Cursor,
     path::Path,
     sync::{
-        atomic::{AtomicI64, AtomicIsize, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU32, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -20,8 +20,8 @@ use sha2::{Digest, Sha256};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-    PhysicalPosition, Rect, WindowEvent,
+    AppHandle, Emitter, Manager, PhysicalPosition, Rect, State, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_global_shortcut::Shortcut;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -40,6 +40,7 @@ use settings::SettingsStore;
 use storage::{NewItem, SqliteStore};
 
 const HIDDEN_RESTART_MARKER: &str = ".restart-hidden";
+const MAIN_TOGGLE_DEBOUNCE_MS: i64 = 300;
 
 struct AppState {
     store: SqliteStore,
@@ -48,6 +49,8 @@ struct AppState {
     target_hwnd: AtomicIsize,
     own_clipboard_sequence: AtomicU32,
     main_shortcut_id: AtomicU32,
+    main_window_creating: AtomicBool,
+    last_main_toggle_at: AtomicI64,
     quick_shortcuts: Mutex<HashMap<u32, usize>>,
     hidden_at: AtomicI64,
     window_hidden_at: Mutex<HashMap<String, i64>>,
@@ -69,6 +72,8 @@ impl AppState {
             target_hwnd: AtomicIsize::new(0),
             own_clipboard_sequence: AtomicU32::new(0),
             main_shortcut_id: AtomicU32::new(0),
+            main_window_creating: AtomicBool::new(false),
+            last_main_toggle_at: AtomicI64::new(0),
             quick_shortcuts: Mutex::new(HashMap::new()),
             hidden_at: AtomicI64::new(0),
             window_hidden_at: Mutex::new(HashMap::new()),
@@ -352,7 +357,16 @@ fn watch_panel_window(window: &WebviewWindow) {
             }
         }
         WindowEvent::Focused(false) if std::env::var_os("WCC_NO_AUTOHIDE").is_none() => {
-            hide_window(&watched);
+            let blurred = watched.clone();
+            thread::spawn(move || {
+                // Frameless Windows can briefly report focus loss while the user grabs a resize
+                // edge. Wait for the pointer action to settle and never hide during a drag.
+                thread::sleep(Duration::from_millis(180));
+                if blurred.is_focused().unwrap_or(false) || platform::left_mouse_button_down() {
+                    return;
+                }
+                hide_window(&blurred);
+            });
         }
         _ => {}
     });
@@ -465,6 +479,14 @@ fn show_main_window(app: &AppHandle) {
     if show_existing_window(app, "main", None) {
         return;
     }
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    if state
+        .main_window_creating
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     remember_paste_target(app);
     let handle = app.clone();
     thread::spawn(move || {
@@ -489,10 +511,17 @@ fn show_main_window(app: &AppHandle) {
             }
             Err(error) => eprintln!("failed to create main panel: {error}"),
         }
+        state.main_window_creating.store(false, Ordering::Release);
     });
 }
 
 fn toggle_main_window(app: &AppHandle) {
+    let state = app.state::<Arc<AppState>>();
+    let now = epoch_ms();
+    let previous = state.last_main_toggle_at.swap(now, Ordering::AcqRel);
+    if now - previous < MAIN_TOGGLE_DEBOUNCE_MS {
+        return;
+    }
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
             hide_window(&window);
@@ -881,7 +910,10 @@ async fn webdav_sync_now(
 
 #[tauri::command]
 fn toggle_pin(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    state.store.toggle_pin(id).map_err(|error| error.to_string())?;
+    state
+        .store
+        .toggle_pin(id)
+        .map_err(|error| error.to_string())?;
     let _ = app.emit("witchcat://changed", ());
     Ok(())
 }
@@ -1188,6 +1220,8 @@ mod tests {
             target_hwnd: AtomicIsize::new(0),
             own_clipboard_sequence: AtomicU32::new(0),
             main_shortcut_id: AtomicU32::new(0),
+            main_window_creating: AtomicBool::new(false),
+            last_main_toggle_at: AtomicI64::new(0),
             quick_shortcuts: Mutex::new(HashMap::new()),
             hidden_at: AtomicI64::new(0),
             window_hidden_at: Mutex::new(HashMap::new()),

@@ -31,8 +31,8 @@ mod imp {
         UI::{
             HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
             Input::KeyboardAndMouse::{
-                keybd_event, GetAsyncKeyState, KEYEVENTF_KEYUP, VK_CONTROL, VK_LWIN, VK_MENU,
-                VK_RWIN, VK_SHIFT,
+                keybd_event, GetAsyncKeyState, KEYEVENTF_KEYUP, VK_CONTROL, VK_LBUTTON, VK_LWIN,
+                VK_MENU, VK_RWIN, VK_SHIFT,
             },
             Shell::DragQueryFileW,
             WindowsAndMessaging::{
@@ -151,6 +151,10 @@ mod imp {
             return 0;
         }
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    pub fn left_mouse_button_down() -> bool {
+        unsafe { (GetAsyncKeyState(VK_LBUTTON as i32) & i16::MIN) != 0 }
     }
 
     pub fn start_clipboard_notifications() -> Result<mpsc::Receiver<()>, String> {
@@ -492,6 +496,9 @@ mod imp {
     }
     pub fn set_window_icons(_window: &tauri::WebviewWindow) -> Result<(), String> {
         Ok(())
+    }
+    pub fn left_mouse_button_down() -> bool {
+        false
     }
 }
 

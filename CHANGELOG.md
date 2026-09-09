@@ -4,7 +4,9 @@
 
 ## [未发布]
 
-暂无。
+### 变更
+
+- 项目许可由 CC BY-NC-SA 4.0 更换为 [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)：仍仅限非商业使用，不再要求衍生作品相同方式共享；商业使用仍需联系作者取得额外授权。已发布的历史版本继续按其随附的旧许可执行。
 
 ## [1.5.1] - 2026-08-29
 

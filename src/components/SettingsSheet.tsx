@@ -555,14 +555,14 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
               </div>
               <div className="flex h-8 items-center gap-2 text-[11px]">
                 <Scale className="size-3.5 text-black/35 dark:text-white/35" />
-                <span className="text-black/40 dark:text-white/40">开源协议</span>
+                <span className="text-black/40 dark:text-white/40">许可协议</span>
                 <a
-                  href="https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans"
+                  href="https://polyformproject.org/licenses/noncommercial/1.0.0"
                   target="_blank"
                   rel="noreferrer"
                   className="ml-auto font-medium text-black/60 transition hover:text-brand-600 dark:text-white/62 dark:hover:text-brand-400"
                 >
-                  CC BY-NC-SA 4.0
+                  PolyForm NC 1.0.0
                 </a>
               </div>
             </div>

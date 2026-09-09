@@ -2,7 +2,7 @@
   "name": "witch-clipboard",
   "version": "1.5.1",
   "private": true,
-  "license": "CC-BY-NC-SA-4.0",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "description": "Witch Clipboard — 本地优先的剪贴板管理器：自动分类、来源搜索、关联配置、加密存储与局域网跨设备同步。",
   "keywords": [
     "clipboard",

@@ -292,6 +292,6 @@ scripts/     性能基准、系统剪贴板 E2E 与图标维护脚本
 - 邮箱：witchscottishfoldcat@gmail.com
 - 网站：[www.witchcat.cn](https://www.witchcat.cn)
 - 仓库：[witchscottishfoldcat/Witch-Clipboard](https://github.com/witchscottishfoldcat/Witch-Clipboard)
-- 许可： [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+- 许可： [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
 
-允许在署名、非商业、相同方式共享的条件下使用与修改。商业使用请先联系作者取得额外授权。
+允许用于任何非商业目的（个人学习、研究、娱乐、业余项目等），分发时需附带本许可或其链接并保留作者署名。商业使用请先联系作者取得额外授权。
