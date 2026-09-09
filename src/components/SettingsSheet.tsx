@@ -26,6 +26,9 @@ import type { FilterId, SecurityInfo, Settings } from '@shared/types'
 import { api } from '@/lib/api'
 import { UpdateSection } from './UpdateSection'
 import { WebDavSection } from './WebDavSection'
+
+// WebDAV 同步功能尚未完成，先在设置页隐藏；做好后改回 true 即可恢复入口
+const WEBDAV_ENABLED = false
 import { KIND_FILTERS } from '@/lib/kinds'
 import { ACCENT_OPTIONS, applyAccent } from '@/lib/accent'
 import { applyPanelBackgroundOpacity } from '@/lib/opacity'
@@ -93,7 +96,10 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
   const [security, setSecurity] = useState<SecurityInfo | null>(null)
   const [confirmClear, setConfirmClear] = useState(false)
   const [capturing, setCapturing] = useState(false)
+  const [opacityDraft, setOpacityDraft] = useState<number | null>(null)
   const hotkeyBox = useRef<HTMLButtonElement>(null)
+  const opacityDraftRef = useRef<number | null>(null)
+  const opacitySaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     void api.getSettings().then(setSettings)
@@ -115,6 +121,30 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
     if (p.accent) applyAccent(p.accent)
     if (p.opacity !== undefined) applyPanelBackgroundOpacity(p.opacity)
     return next
+  }
+
+  // 拖动会高频触发 onChange：先同步刷新预览，停手后再落盘，避免每个刻度都写一次设置文件
+  useEffect(
+    () => () => {
+      if (opacitySaveTimer.current) clearTimeout(opacitySaveTimer.current)
+      const pending = opacityDraftRef.current
+      if (pending !== null) void api.saveSettings({ opacity: pending })
+    },
+    [],
+  )
+
+  const changeOpacity = (value: number): void => {
+    opacityDraftRef.current = value
+    setOpacityDraft(value)
+    applyPanelBackgroundOpacity(value)
+    if (opacitySaveTimer.current) clearTimeout(opacitySaveTimer.current)
+    opacitySaveTimer.current = setTimeout(() => {
+      opacitySaveTimer.current = null
+      void patch({ opacity: value }).then(() => {
+        if (opacityDraftRef.current === value) opacityDraftRef.current = null
+        setOpacityDraft((current) => (current === value ? null : current))
+      })
+    }, 250)
   }
 
   // 热键录制：捕获阶段拦下按键，别让 App 的全局快捷键先处理掉
@@ -251,7 +281,7 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
               <Blend className="size-3.5" />
               背景透明度
               <span className="ml-auto tabular-nums text-[10.5px] text-black/45 dark:text-white/45">
-                {settings?.opacity ?? 90}%
+                {opacityDraft ?? settings?.opacity ?? 90}%
               </span>
             </div>
             <div className="flex h-9 items-center gap-2.5 rounded-xl bg-black/[0.035] px-3 dark:bg-white/[0.055]">
@@ -261,9 +291,9 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
                 min={20}
                 max={100}
                 step={5}
-                value={settings?.opacity ?? 90}
+                value={opacityDraft ?? settings?.opacity ?? 90}
                 aria-label="背景透明度"
-                onChange={(event) => void patch({ opacity: Number(event.target.value) })}
+                onChange={(event) => changeOpacity(Number(event.target.value))}
                 className="h-1 flex-1 cursor-pointer accent-[var(--color-brand-500)]"
               />
               <span className="text-[9.5px] text-black/30 dark:text-white/30">100%</span>
@@ -514,7 +544,7 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
             </button>
           </section>
 
-          <WebDavSection onToast={onToast} />
+          {WEBDAV_ENABLED && <WebDavSection onToast={onToast} />}
 
           <UpdateSection onToast={onToast} />
 
