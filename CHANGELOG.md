@@ -2,6 +2,16 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.7.0] - 2026-09-10
+
+### 新增
+
+- 设置页「开发者」区块新增赞助入口，可前往[支持页面](https://www.witchcat.cn/zh/support)支持开发。
+
+### 变更
+
+- README 改为中英双语（新增 [README.en.md](./README.en.md)），加入完整面板与迷你面板截图和赞助链接。
+
 ## [1.6.0] - 2026-09-10
 
 ### 新增
