@@ -65,9 +65,17 @@ the server never sees your clipboard plaintext.
 
 Grab it from [Releases](https://github.com/witchscottishfoldcat/Witch-Clipboard/releases/latest):
 
-- Windows x64: `Witch-Clipboard-<version>-x64-setup.exe`
-- Windows ARM64: `Witch-Clipboard-<version>-arm64-setup.exe` (experimental)
+- Windows x64: `Witch.Clipboard_<version>_x64-setup.exe`
+- Windows ARM64: `Witch.Clipboard_<version>_arm64-setup.exe` (experimental)
 - Windows x64/ARM64 portable: `Witch-Clipboard-<version>-<arch>-portable.zip` (unpack and run)
+
+Each release also includes `SHA256SUMS.txt`. Verify a downloaded file in PowerShell:
+
+```powershell
+Get-FileHash .\Witch.Clipboard_1.7.2_x64-setup.exe -Algorithm SHA256
+```
+
+Compare the resulting `Hash` with the entry for the same filename in `SHA256SUMS.txt`; an exact match confirms that the download was not corrupted or replaced.
 
 Windows installers use NSIS with an optional install location; uninstalling keeps your data. Official
 releases target Windows only; artifacts you build yourself land in `src-tauri/target/<target>/release/bundle/nsis/`.

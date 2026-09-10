@@ -63,9 +63,17 @@
 
 从 [Releases](https://github.com/witchscottishfoldcat/Witch-Clipboard/releases/latest) 下载：
 
-- Windows x64：`Witch-Clipboard-<版本>-x64-setup.exe`
-- Windows ARM64：`Witch-Clipboard-<版本>-arm64-setup.exe`（实验性）
+- Windows x64：`Witch.Clipboard_<版本>_x64-setup.exe`
+- Windows ARM64：`Witch.Clipboard_<版本>_arm64-setup.exe`（实验性）
 - Windows x64/ARM64 便携版：`Witch-Clipboard-<版本>-<架构>-portable.zip`（解压即用）
+
+每个 Release 同时提供 `SHA256SUMS.txt`。下载后可在 PowerShell 中校验文件：
+
+```powershell
+Get-FileHash .\Witch.Clipboard_1.7.2_x64-setup.exe -Algorithm SHA256
+```
+
+将输出的 `Hash` 与 `SHA256SUMS.txt` 中同名文件的值比较；完全一致才表示下载文件未损坏或被替换。
 
 Windows 安装包使用 NSIS，可选安装位置，卸载不删除数据。正式发行只面向 Windows，
 自己构建的产物在 `src-tauri/target/<target>/release/bundle/nsis/` 下。
