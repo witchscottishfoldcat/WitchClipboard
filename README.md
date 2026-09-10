@@ -1,4 +1,8 @@
 <p align="center">
+  简体中文 · <a href="./README.en.md">English</a>
+</p>
+
+<p align="center">
   <img src="resources/icon-256.png" width="128" alt="Witch Clipboard" />
 </p>
 
@@ -16,6 +20,17 @@
   <a href="./CHANGELOG.md">更新日志</a>
   ·
   <a href="https://www.witchcat.cn">作者网站</a>
+  ·
+  <a href="https://www.witchcat.cn/zh/support">赞助支持 ❤</a>
+</p>
+
+<p align="center">
+  <img src="docs/images/screenshot-panel.png" width="62%" alt="完整面板" />
+  <img src="docs/images/screenshot-mini.png" width="28%" alt="迷你预览面板" />
+</p>
+
+<p align="center">
+  <sub>左：完整面板（<code>Alt+V</code>），右：迷你预览面板（单击托盘图标）</sub>
 </p>
 
 复制过的东西不该丢在一个只记得最后一次的剪贴板里。这个项目做的就是：把你复制过的一切留下来、
@@ -285,6 +300,11 @@ scripts/     性能基准、系统剪贴板 E2E 与图标维护脚本
 ## 版本历史
 
 见 [CHANGELOG.md](./CHANGELOG.md)。
+
+## 支持开发
+
+Witch Clipboard 由作者业余时间维护，免费且无广告。如果它帮到了你，欢迎[赞助支持](https://www.witchcat.cn/zh/support)——
+每一份心意都会变成继续做下去的动力。
 
 ## 开发者与许可
 

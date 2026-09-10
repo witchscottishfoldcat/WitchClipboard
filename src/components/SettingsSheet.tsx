@@ -19,6 +19,7 @@ import {
   UserRound,
   Mail,
   Globe2,
+  Heart,
   Scale,
   Blend,
 } from 'lucide-react'
@@ -581,6 +582,18 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
                   className="ml-auto text-black/60 transition hover:text-brand-600 dark:text-white/62 dark:hover:text-brand-400"
                 >
                   www.witchcat.cn
+                </a>
+              </div>
+              <div className="flex h-8 items-center gap-2 border-b border-black/5 text-[11px] dark:border-white/7">
+                <Heart className="size-3.5 text-rose-500/80 dark:text-rose-400/80" />
+                <span className="text-black/40 dark:text-white/40">赞助</span>
+                <a
+                  href="https://www.witchcat.cn/zh/support"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="ml-auto font-medium text-rose-500 transition hover:text-rose-600 dark:text-rose-400 dark:hover:text-rose-300"
+                >
+                  请作者喝杯咖啡
                 </a>
               </div>
               <div className="flex h-8 items-center gap-2 text-[11px]">
