@@ -17,7 +17,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
@@ -27,7 +29,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "untrusted comment: minisign public key: 98651EA4B81F1EE5\nRWTlHh+4pB5lmA5NoMvgi20O5DWjGqviwFPdH4/ocuy15e+YR9ugCnDZ\n",
       "endpoints": [
         "https://github.com/witchscottishfoldcat/Witch-Clipboard/releases/latest/download/latest.json"
       ],
