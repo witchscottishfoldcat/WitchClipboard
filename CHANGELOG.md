@@ -2,7 +2,11 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [1.7.0] - 2026-09-10
+## [1.7.1] - 2026-09-10
+
+### 修复
+
+- 修复设置页「检查更新」始终报「Could not fetch a valid release JSON from the remote」的问题：发布流程此前从未生成 updater 清单 `latest.json`（`createUpdaterArtifacts` 为 false），配置中的签名公钥也为空；现在接入既有 minisign 密钥，发布产物带签名和 `latest.json`，应用内更新从本版本起可用。已装的旧版本因二进制内没有公钥，本次仍需手动下载升级。
 
 ### 新增
 
