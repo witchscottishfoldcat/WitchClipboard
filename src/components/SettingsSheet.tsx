@@ -1,3 +1,4 @@
+import type { MouseEvent } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import { motion } from 'motion/react'
 import {
@@ -25,6 +26,7 @@ import {
 } from 'lucide-react'
 import type { FilterId, SecurityInfo, Settings } from '@shared/types'
 import { api } from '@/lib/api'
+import { isTauriRuntime, openExternal } from '@/lib/tauri-api'
 import { UpdateSection } from './UpdateSection'
 import { WebDavSection } from './WebDavSection'
 
@@ -101,6 +103,13 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
   const hotkeyBox = useRef<HTMLButtonElement>(null)
   const opacityDraftRef = useRef<number | null>(null)
   const opacitySaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Electron/浏览器里 <a target="_blank"> 有原生行为；Tauri 会静默拦截，须转 open_external
+  const openLink = (event: MouseEvent<HTMLAnchorElement>, url: string) => {
+    if (!isTauriRuntime) return
+    event.preventDefault()
+    openExternal(url).catch(() => onToast('无法打开链接', 'warn'))
+  }
 
   useEffect(() => {
     void api.getSettings().then(setSettings)
@@ -567,6 +576,7 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
                   href="mailto:witchscottishfoldcat@gmail.com"
                   target="_blank"
                   rel="noreferrer"
+                  onClick={(e) => openLink(e, 'mailto:witchscottishfoldcat@gmail.com')}
                   className="ml-auto text-black/60 transition hover:text-brand-600 dark:text-white/62 dark:hover:text-brand-400"
                 >
                   witchscottishfoldcat@gmail.com
@@ -579,6 +589,7 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
                   href="https://www.witchcat.cn"
                   target="_blank"
                   rel="noreferrer"
+                  onClick={(e) => openLink(e, 'https://www.witchcat.cn')}
                   className="ml-auto text-black/60 transition hover:text-brand-600 dark:text-white/62 dark:hover:text-brand-400"
                 >
                   www.witchcat.cn
@@ -591,6 +602,7 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
                   href="https://www.witchcat.cn/zh/support"
                   target="_blank"
                   rel="noreferrer"
+                  onClick={(e) => openLink(e, 'https://www.witchcat.cn/zh/support')}
                   className="ml-auto font-medium text-rose-500 transition hover:text-rose-600 dark:text-rose-400 dark:hover:text-rose-300"
                 >
                   请作者喝杯咖啡
@@ -603,6 +615,9 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
                   href="https://polyformproject.org/licenses/noncommercial/1.0.0"
                   target="_blank"
                   rel="noreferrer"
+                  onClick={(e) =>
+                    openLink(e, 'https://polyformproject.org/licenses/noncommercial/1.0.0')
+                  }
                   className="ml-auto font-medium text-black/60 transition hover:text-brand-600 dark:text-white/62 dark:hover:text-brand-400"
                 >
                   PolyForm NC 1.0.0

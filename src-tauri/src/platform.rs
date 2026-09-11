@@ -34,13 +34,14 @@ mod imp {
                 keybd_event, GetAsyncKeyState, KEYEVENTF_KEYUP, VK_CONTROL, VK_LBUTTON, VK_LWIN,
                 VK_MENU, VK_RWIN, VK_SHIFT,
             },
-            Shell::DragQueryFileW,
+            Shell::{DragQueryFileW, ShellExecuteW},
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, MessageBoxW,
                 PrivateExtractIconsW, RegisterClassW, SendMessageW, SetForegroundWindow,
                 TranslateMessage, HICON, HWND_MESSAGE, ICON_BIG, ICON_SMALL, MB_ICONERROR, MB_OK,
-                MSG, SM_CXICON, SM_CXSMICON, WM_CLIPBOARDUPDATE, WM_SETICON, WNDCLASSW,
+                MSG, SM_CXICON, SM_CXSMICON, SW_SHOWNORMAL, WM_CLIPBOARDUPDATE, WM_SETICON,
+                WNDCLASSW,
             },
         },
     };
@@ -136,6 +137,106 @@ mod imp {
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL as WPARAM, small as LPARAM);
         }
         Ok(())
+    }
+
+    // ShellExecuteW launches whatever handler the registry maps for the target, so a URL taken
+    // from the renderer must be pinned to schemes that can only resolve to a browser or mail app.
+    fn is_allowed_external_url(url: &str) -> bool {
+        let lowered = url.to_ascii_lowercase();
+        lowered.starts_with("https://")
+            || lowered.starts_with("http://")
+            || lowered.starts_with("mailto:")
+    }
+
+    pub fn open_url(url: &str) -> Result<(), String> {
+        if !is_allowed_external_url(url) {
+            return Err(format!("unsupported external url scheme: {url}"));
+        }
+        let operation = wide("open");
+        let file = wide(url);
+        // ShellExecuteW returns a pseudo-HINSTANCE; anything above 32 signals success.
+        let result = unsafe {
+            ShellExecuteW(
+                null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                null(),
+                null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (result as isize) > 32 {
+            Ok(())
+        } else {
+            Err(format!("ShellExecuteW failed: {result:?}"))
+        }
+    }
+
+    /// (friendly name, if_type, ipv4 string) for every adapter holding an IPv4 unicast address.
+    pub fn lan_candidates() -> Vec<(String, u32, String)> {
+        use std::net::Ipv4Addr;
+        use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+            GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+        };
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR, SOCKADDR_IN};
+
+        fn pwstr_to_string(pointer: *const u16) -> String {
+            if pointer.is_null() {
+                return String::new();
+            }
+            let mut length = 0usize;
+            unsafe {
+                while *pointer.add(length) != 0 {
+                    length += 1;
+                }
+            }
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(pointer, length) })
+        }
+
+        let mut size: u32 = 16 * 1024;
+        let mut buffer: Vec<u64>;
+        loop {
+            buffer = vec![0; size.div_ceil(8) as usize];
+            let status = unsafe {
+                GetAdaptersAddresses(
+                    AF_INET as u32,
+                    GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                    null_mut(),
+                    buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                    &mut size,
+                )
+            };
+            if status == ERROR_BUFFER_OVERFLOW {
+                continue;
+            }
+            if status != 0 {
+                return Vec::new();
+            }
+            break;
+        }
+
+        let mut candidates = Vec::new();
+        let mut adapter = buffer.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        while !adapter.is_null() {
+            let name = pwstr_to_string(unsafe { (*adapter).FriendlyName });
+            let if_type = unsafe { (*adapter).IfType };
+            let mut unicast =
+                unsafe { (*adapter).FirstUnicastAddress } as *const IP_ADAPTER_UNICAST_ADDRESS_LH;
+            while !unicast.is_null() {
+                let sockaddr = unsafe { (*unicast).Address.lpSockaddr } as *const SOCKADDR;
+                if !sockaddr.is_null() && unsafe { (*sockaddr).sa_family } == AF_INET {
+                    let sin = unsafe { &*(sockaddr as *const SOCKADDR_IN) };
+                    // S_addr 保存的是网络字节序，先转回主机序数值，Ipv4Addr 才能按 a.b.c.d 解读
+                    let address = u32::from_be(unsafe { sin.sin_addr.S_un.S_addr });
+                    candidates.push((name.clone(), if_type, Ipv4Addr::from(address).to_string()));
+                }
+                unicast = unsafe { (*unicast).Next };
+            }
+            adapter = unsafe { (*adapter).Next };
+        }
+        candidates
     }
 
     unsafe extern "system" fn clipboard_window_proc(
@@ -454,6 +555,19 @@ mod imp {
             assert_eq!(u32::from_le_bytes(payload[16..20].try_into().unwrap()), 1);
             assert_eq!(&payload[payload.len() - 4..], &[0, 0, 0, 0]);
         }
+
+        #[test]
+        fn open_url_rejects_schemes_that_could_launch_arbitrary_targets() {
+            fn allowed(url: &str) -> bool {
+                is_allowed_external_url(url)
+            }
+            assert!(!allowed("file:///C:/Windows/System32/calc.exe"));
+            assert!(!allowed("\\\\server\\share\\tool.exe"));
+            assert!(!allowed("ms-settings:display"));
+            assert!(allowed("https://www.witchcat.cn"));
+            assert!(allowed("HTTPS://www.witchcat.cn"));
+            assert!(allowed("mailto:witchscottishfoldcat@gmail.com"));
+        }
     }
 }
 
@@ -496,6 +610,12 @@ mod imp {
     }
     pub fn set_window_icons(_window: &tauri::WebviewWindow) -> Result<(), String> {
         Ok(())
+    }
+    pub fn open_url(_url: &str) -> Result<(), String> {
+        Err("opening external URLs is only available on Windows".to_string())
+    }
+    pub fn lan_candidates() -> Vec<(String, u32, String)> {
+        Vec::new()
     }
     pub fn left_mouse_button_down() -> bool {
         false

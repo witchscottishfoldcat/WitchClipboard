@@ -14,6 +14,11 @@ import type {
 
 export const isTauriRuntime = '__TAURI_INTERNALS__' in window
 
+/** Tauri 的 WebView 会拦截 target="_blank" 外链，必须经 Rust 侧 ShellExecuteW 打开 */
+export async function openExternal(url: string): Promise<void> {
+  await invoke('open_external', { url })
+}
+
 function subscribe(event: string, cb: () => void): () => void {
   let disposed = false
   let unlisten: UnlistenFn | null = null

@@ -858,6 +858,11 @@ fn open_data_dir(state: State<'_, Arc<AppState>>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    platform::open_url(&url)
+}
+
+#[tauri::command]
 fn cross_device_start(state: State<'_, Arc<AppState>>) -> Result<cross_device::Status, String> {
     state.cross_device.start()?;
     if let Ok(mut clipboard) = Clipboard::new() {
@@ -1175,6 +1180,7 @@ fn main() {
             expand_panel,
             reveal_file,
             open_data_dir,
+            open_external,
             cross_device_start,
             cross_device_stop,
             cross_device_status,
@@ -1293,8 +1299,17 @@ fn main() {
             start_text_monitor(app.handle().clone(), state);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run Witch Clipboard");
+        .build(tauri::generate_context!())
+        .expect("failed to build Witch Clipboard")
+        .run(|_app, event| {
+            // 面板隐藏 60 秒后 WebView 会被销毁以省内存，而 Tauri 默认在最后一个窗口销毁时
+            // 退出整个进程——会把后台仍在服务的跨设备 HTTP 服务一并杀掉。这里只拦这种
+            // "无主"退出（code 为 None）；托盘退出（exit(0)）与重启（request_restart）携带
+            // code，照常放行。系统关机不走此事件，不受影响。
+            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }
 
 #[cfg(test)]

@@ -416,11 +416,19 @@ fn handle(
     download_dir: &Path,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(12)));
+    let peer = stream
+        .peer_addr()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| "?".to_string());
     let request = match read_request(&mut stream) {
         Ok(request) => request,
-        Err(_) => return,
+        Err(error) => {
+            eprintln!("[cross-device] {peer} read failed: {error}");
+            return;
+        }
     };
     let first = request.header.lines().next().unwrap_or_default();
+    eprintln!("[cross-device] {peer} {first}");
     let mut first_parts = first.split_whitespace();
     let method = first_parts.next().unwrap_or("");
     let raw_path = first_parts.next().unwrap_or("/");
@@ -569,16 +577,47 @@ struct HttpRequest {
 }
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
+    let peer = stream
+        .peer_addr()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| "?".to_string());
     let mut data = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     let mut expected = None;
+    // WouldBlock 在 Windows 上是"数据还没到"的瞬态信号（请求体分多个突发到达时必然出现），
+    // 必须继续等待而不是断开；总时长仍由 deadline 兜底，防止死连接占住线程。
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
     loop {
-        let count = stream.read(&mut chunk)?;
+        if std::time::Instant::now() >= deadline {
+            eprintln!("[cross-device] {peer} read deadline exceeded at {} bytes", data.len());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read deadline exceeded",
+            ));
+        }
+        let count = match stream.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(error) => {
+                eprintln!("[cross-device] {peer} socket read error after {} bytes: {error}", data.len());
+                return Err(error);
+            }
+        };
         if count == 0 {
+            if expected.is_some_and(|length| data.len() < length) {
+                eprintln!("[cross-device] {peer} client closed early: got {} of expected bytes", data.len());
+            }
             break;
         }
         data.extend_from_slice(&chunk[..count]);
         if data.len() > MAX_REQUEST_BYTES {
+            eprintln!("[cross-device] {peer} request too large: {} bytes (limit {MAX_REQUEST_BYTES})", data.len());
             return Err(std::io::Error::other("request too large"));
         }
         if expected.is_none() {
@@ -602,7 +641,10 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     let position = data
         .windows(4)
         .position(|value| value == b"\r\n\r\n")
-        .ok_or_else(|| std::io::Error::other("missing header"))?;
+        .ok_or_else(|| {
+            eprintln!("[cross-device] {peer} missing header terminator after {} bytes", data.len());
+            std::io::Error::other("missing header")
+        })?;
     Ok(HttpRequest {
         header: String::from_utf8_lossy(&data[..position]).into_owned(),
         body: data[position + 4..].to_vec(),
@@ -1081,10 +1123,77 @@ fn write_header(
     let _ = stream.write_all(header.as_bytes());
 }
 
-fn lan_address() -> Option<String> {
+/// 用默认路由探测"能上外网的出口 IP"；在 TUN/VPN 场景下可能返回虚拟网卡地址，调用方需校验
+fn default_route_address() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("192.0.2.1:80").ok()?;
     Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+fn lan_address() -> Option<String> {
+    // 默认路由探测会把 TUN/VPN 虚拟网卡当成"出口"（如 Clash TUN 返回 198.18.0.1），
+    // 手机访问不到这类地址；只有落在局域网私有网段才可信，否则枚举网卡重新挑选。
+    if let Some(address) = default_route_address() {
+        if is_rfc1918_address(&address) {
+            return Some(address);
+        }
+    }
+    let candidates = crate::platform::lan_candidates();
+    if candidates.is_empty() {
+        return default_route_address();
+    }
+    candidates
+        .iter()
+        .filter_map(|(name, if_type, ip)| {
+            lan_candidate_rank(name, *if_type, ip).map(|rank| (rank, ip.clone()))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, ip)| ip)
+}
+
+fn is_rfc1918_address(ip: &str) -> bool {
+    ip.parse::<std::net::Ipv4Addr>()
+        .map(|v4| v4.is_private())
+        .unwrap_or(false)
+}
+
+const IF_TYPE_LOOPBACK: u32 = 24;
+const IF_TYPE_IEEE80211: u32 = 71;
+const IF_TYPE_TUNNEL: u32 = 131;
+
+/// 已知虚拟网卡关键字：这类网卡（VMware/WSL/Hyper-V/Radmin/Clash TUN 等）手机到不了
+const VIRTUAL_ADAPTER_KEYWORDS: &[&str] = &[
+    "vmware",
+    "virtualbox",
+    "vethernet",
+    "hyper-v",
+    "wsl",
+    "loopback",
+    "radmin",
+    "clash",
+    "tailscale",
+    "zerotier",
+    "hamachi",
+    "tun",
+];
+
+/// 排除环回、隧道类型、非 RFC1918 网段以及名字命中虚拟网卡关键字的候选，
+/// 剩余里 Wi-Fi（IEEE 802.11）优先。返回 None 表示该网卡不适合放进二维码。
+fn lan_candidate_rank(name: &str, if_type: u32, ip: &str) -> Option<u8> {
+    if !is_rfc1918_address(ip) {
+        return None;
+    }
+    if if_type == IF_TYPE_LOOPBACK || if_type == IF_TYPE_TUNNEL {
+        return None;
+    }
+    let lowered = name.to_ascii_lowercase();
+    if VIRTUAL_ADAPTER_KEYWORDS
+        .iter()
+        .any(|keyword| lowered.contains(keyword))
+    {
+        return None;
+    }
+    Some(if if_type == IF_TYPE_IEEE80211 { 2 } else { 1 })
 }
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -1127,12 +1236,109 @@ fn percent_encode(value: &str) -> String {
 }
 
 fn mobile_page() -> String {
-    r#"<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Witch Clipboard</title><style>body{font:15px system-ui;max-width:720px;margin:24px auto;padding:16px;background:#18131f;color:#eee}section{background:#2a2234;padding:18px;border-radius:18px;margin:12px 0}textarea{box-sizing:border-box;width:100%;min-height:110px;padding:12px}button,input{font:inherit}button{padding:10px 16px;background:#8b5cf6;color:white;border:0;border-radius:10px}.muted{color:#aaa;font-size:13px}progress{width:100%}a{color:#c4b5fd}</style><h1>Witch Clipboard</h1><p id=approval>正在请求电脑确认这台设备…</p><main hidden><section><h3>来自电脑</h3><div id=received>等待内容…</div></section><section><h3>发送文字</h3><textarea id=out></textarea><p><button onclick=sendText()>发送</button></p></section><section><h3>发送文件</h3><input id=file type=file multiple><p><button onclick=uploadFiles()>上传</button></p><div id=uploads></div></section></main><script>const token=location.pathname.split('/').pop(),device=localStorage.wccDevice||(localStorage.wccDevice=crypto.randomUUID()),headers={'X-Witch-Device':device};let revision=0;async function hello(){let r=await fetch('/api/hello/'+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:device,name:navigator.platform||'浏览器设备'})}),j=await r.json();if(j.approved){approval.textContent='已由电脑确认';document.querySelector('main').hidden=false;poll()}else setTimeout(hello,1200)}async function poll(){try{let r=await fetch('/api/state/'+token,{headers,cache:'no-store'});if(r.status===403){location.reload();return}let s=await r.json(),v=s.latest;if(v&&v.revision!==revision){revision=v.revision;if(v.kind==='image')received.innerHTML='<img style="max-width:100%" src="'+v.imageUrl+'">';else if(v.kind==='files')received.innerHTML=v.files.map(f=>'<p><a download href="'+f.url+'">'+esc(f.name)+'</a> · '+fmt(f.size)+'</p>').join('');else received.innerHTML='<pre></pre>',received.querySelector('pre').textContent=v.text}}catch{}setTimeout(poll,1000)}async function sendText(){await fetch('/api/send/'+token,{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({text:out.value})});out.value=''}async function uploadFiles(){for(const f of file.files)await upload(f)}async function upload(f){let client=device+':'+f.name+':'+f.size+':'+f.lastModified,row=document.createElement('p');uploads.append(row);let init=await fetch('/api/upload-init/'+token,{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({name:f.name,size:f.size,clientId:client})}).then(r=>r.json()),offset=init.offset||0;while(offset<f.size){row.textContent=f.name+' '+Math.round(offset/f.size*100)+'%';let chunk=f.slice(offset,Math.min(offset+init.chunkSize,f.size)),ok=false,resync=false;for(let retry=0;retry<3&&!ok&&!resync;retry++){try{let r=await fetch('/api/upload-chunk/'+token+'/'+init.id+'?offset='+offset,{method:'PUT',headers,body:chunk}),j=await r.json();if(r.status===409&&j.offset!=null)offset=j.offset,resync=true;else if(r.ok)offset=j.offset,ok=true}catch{}if(!ok&&!resync)await new Promise(r=>setTimeout(r,500*(retry+1)))}if(resync)continue;if(!ok){row.textContent=f.name+' 传输中断，再次选择同一文件可续传';return}}row.textContent=f.name+' 完成'}function esc(s){let d=document.createElement('div');d.textContent=s;return d.innerHTML}function fmt(n){return n>1048576?(n/1048576).toFixed(1)+' MB':Math.ceil(n/1024)+' KB'}hello()</script></html>"#.to_string()
+    r#"<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Witch Clipboard</title><style>body{font:15px system-ui;max-width:720px;margin:24px auto;padding:16px;background:#18131f;color:#eee}section{background:#2a2234;padding:18px;border-radius:18px;margin:12px 0}textarea{box-sizing:border-box;width:100%;min-height:110px;padding:12px}button,input{font:inherit}button{padding:10px 16px;background:#8b5cf6;color:white;border:0;border-radius:10px}.muted{color:#aaa;font-size:13px}progress{width:100%}a{color:#c4b5fd}</style><h1>Witch Clipboard</h1><p id=approval>正在请求电脑确认这台设备…</p><main hidden><section><h3>来自电脑</h3><div id=received>等待内容…</div></section><section><h3>发送文字</h3><textarea id=out></textarea><p><button onclick=sendText()>发送</button></p></section><section><h3>发送文件</h3><input id=file type=file multiple><p><button onclick=uploadFiles()>上传</button></p><div id=uploads></div></section></main><script>const token=location.pathname.split('/').pop(),deviceId=()=>crypto.randomUUID?crypto.randomUUID():'wcc-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10),device=localStorage.wccDevice||(localStorage.wccDevice=deviceId()),headers={'X-Witch-Device':device};let revision=0;async function hello(){try{let r=await fetch('/api/hello/'+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:device,name:navigator.platform||'浏览器设备'})}),j=await r.json();if(j.approved){approval.textContent='已由电脑确认';document.querySelector('main').hidden=false;poll()}else setTimeout(hello,1200)}catch(e){approval.textContent='连接失败，请在电脑上重新生成二维码后再次扫码'}}async function poll(){try{let r=await fetch('/api/state/'+token,{headers,cache:'no-store'});if(r.status===403){location.reload();return}let s=await r.json(),v=s.latest;if(v&&v.revision!==revision){revision=v.revision;if(v.kind==='image')received.innerHTML='<img style="max-width:100%" src="'+v.imageUrl+'">';else if(v.kind==='files')received.innerHTML=v.files.map(f=>'<p><a download href="'+f.url+'">'+esc(f.name)+'</a> · '+fmt(f.size)+'</p>').join('');else received.innerHTML='<pre></pre>',received.querySelector('pre').textContent=v.text}}catch{}setTimeout(poll,1000)}async function sendText(){await fetch('/api/send/'+token,{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({text:out.value})});out.value=''}async function uploadFiles(){for(const f of file.files)await upload(f)}async function upload(f){let client=device+':'+f.name+':'+f.size+':'+f.lastModified,row=document.createElement('p');uploads.append(row);let init=await fetch('/api/upload-init/'+token,{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({name:f.name,size:f.size,clientId:client})}).then(r=>r.json()),offset=init.offset||0;while(offset<f.size){row.textContent=f.name+' '+Math.round(offset/f.size*100)+'%';let chunk=f.slice(offset,Math.min(offset+init.chunkSize,f.size)),ok=false,resync=false;for(let retry=0;retry<3&&!ok&&!resync;retry++){try{let r=await fetch('/api/upload-chunk/'+token+'/'+init.id+'?offset='+offset,{method:'PUT',headers,body:chunk}),j=await r.json();if(r.status===409&&j.offset!=null)offset=j.offset,resync=true;else if(r.ok)offset=j.offset,ok=true}catch{}if(!ok&&!resync)await new Promise(r=>setTimeout(r,500*(retry+1)))}if(resync)continue;if(!ok){row.textContent=f.name+' 传输中断，再次选择同一文件可续传';return}}row.textContent=f.name+' 完成'}function esc(s){let d=document.createElement('div');d.textContent=s;return d.innerHTML}function fmt(n){return n>1048576?(n/1048576).toFixed(1)+' MB':Math.ceil(n/1024)+' KB'}hello()</script></html>"#.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_rank_rejects_tunnel_virtual_and_non_lan_candidates() {
+        // 开发机真实网卡形态：FlClash TUN 抢默认路由返回 198.18.0.1，Radmin 是 26 段
+        assert_eq!(lan_candidate_rank("FlClash", IF_TYPE_TUNNEL, "198.18.0.1"), None);
+        assert_eq!(lan_candidate_rank("Radmin VPN", 6, "26.139.172.191"), None);
+        assert_eq!(lan_candidate_rank("以太网", 6, "169.254.169.111"), None);
+        assert_eq!(lan_candidate_rank("loopback", IF_TYPE_LOOPBACK, "127.0.0.1"), None);
+        assert_eq!(
+            lan_candidate_rank("VMware Network Adapter VMnet8", 6, "10.16.0.1"),
+            None
+        );
+        assert_eq!(
+            lan_candidate_rank("vEthernet (WSL (Hyper-V firewall))", 6, "172.23.96.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn lan_rank_prefers_wifi_over_ethernet_for_real_lan_addresses() {
+        assert_eq!(lan_candidate_rank("WLAN", IF_TYPE_IEEE80211, "192.168.31.143"), Some(2));
+        assert_eq!(lan_candidate_rank("以太网", 6, "192.168.1.8"), Some(1));
+    }
+
+    #[test]
+    fn rfc1918_check_accepts_only_private_lan_ranges() {
+        assert!(is_rfc1918_address("192.168.31.143"));
+        assert!(is_rfc1918_address("10.0.0.5"));
+        assert!(is_rfc1918_address("172.16.1.100"));
+        assert!(!is_rfc1918_address("198.18.0.1"));
+        assert!(!is_rfc1918_address("169.254.169.111"));
+        assert!(!is_rfc1918_address("127.0.0.1"));
+        assert!(!is_rfc1918_address("not-an-ip"));
+    }
+
+    fn request(port: &str, raw: &str) -> String {
+        request_via("127.0.0.1", port, raw)
+    }
+
+    /// 手机侧等价请求：连到指定主机（测试里用真实局域网 IP）而不是回环地址
+    fn request_via(host: &str, port: &str, raw: &str) -> String {
+        let mut stream = TcpStream::connect(format!("{host}:{port}")).unwrap();
+        stream.write_all(raw.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    /// 真实局域网环境端到端验证：二维码地址必须是真实局域网 IP，
+    /// 且手机视角（经该 IP 连接）能加载配对页并完成 hello 握手与桌面批准。
+    /// 依赖测试机存在局域网 IPv4，CI/无网卡环境用 `cargo test -- --ignored` 显式跑。
+    #[test]
+    #[ignore = "requires a machine with a real LAN adapter"]
+    fn pair_url_targets_the_real_lan_and_serves_over_it() {
+        let lan = lan_address().expect("this machine must expose a LAN IPv4 for the e2e check");
+        assert!(
+            is_rfc1918_address(&lan),
+            "lan_address must be a private LAN address, got {lan}"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let service = CrossDevice::new(sender, directory.path());
+        let status = service.start().unwrap();
+        let url = status.url.expect("started service must expose a pair url");
+        let (base, token) = url.split_once("/pair/").unwrap();
+        let authority = base.strip_prefix("http://").unwrap();
+        let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority);
+        assert_eq!(
+            host, lan,
+            "pair url must point at the real LAN address, got {url}"
+        );
+        let port = authority.rsplit(':').next().unwrap();
+
+        // 手机第 1 步：扫码后浏览器加载配对页
+        let page = request_via(lan.trim(), port, &format!("GET /pair/{token} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"));
+        assert!(page.contains("200 OK"), "pair page must load over the LAN address");
+        assert!(page.contains("Witch Clipboard"), "pair page html must be served");
+
+        // 手机第 2 步：hello 握手，等待桌面批准
+        let hello = r#"{"id":"phone-lan","name":"LAN e2e phone"}"#;
+        let response = request_via(lan.trim(), port, &format!("POST /api/hello/{token} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", hello.len(), hello));
+        assert!(response.contains("\"approved\":false"), "first hello must be pending, got {response}");
+
+        // 桌面批准后，同一设备再次 hello 应获得确认（配对页轮询的就是这条路径）
+        service.approve_device("phone-lan").unwrap();
+        let response = request_via(lan.trim(), port, &format!("POST /api/hello/{token} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", hello.len(), hello));
+        assert!(response.contains("\"approved\":true"), "approved hello must confirm, got {response}");
+
+        // 批准后的设备发送文字，桌面端应收到
+        let body = r#"{"text":"via lan"}"#;
+        let response = request_via(lan.trim(), port, &format!("POST /api/send/{token} HTTP/1.1\r\nHost: {host}\r\nX-Witch-Device: phone-lan\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body));
+        assert!(response.contains("200 OK"));
+        assert!(
+            matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Incoming::Text(value) if value == "via lan")
+        );
+    }
 
     fn request_bytes(port: &str, header: &str, body: &[u8]) -> Vec<u8> {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
@@ -1141,10 +1347,6 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
         response
-    }
-
-    fn request(port: &str, raw: &str) -> String {
-        String::from_utf8(request_bytes(port, raw, &[])).unwrap()
     }
 
     #[test]
