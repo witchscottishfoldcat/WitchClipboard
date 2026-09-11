@@ -1,6 +1,6 @@
 [package]
 name = "witch-clipboard"
-version = "1.7.3"
+version = "1.7.4"
 description = "Local-first clipboard manager with encrypted history"
 authors = ["Thewitchcat"]
 edition = "2021"

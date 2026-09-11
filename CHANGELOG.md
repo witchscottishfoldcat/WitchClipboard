@@ -2,6 +2,14 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.7.4] - 2026-09-12
+
+### 修复
+
+- 设置页外链统一通过安全的 Windows ShellExecute 打开，仅允许 `http`、`https` 和 `mailto`。
+- 修复面板隐藏后 WebView 回收导致后台跨设备服务误退出的问题。
+- 提高跨设备连接对 Windows 突发 `WouldBlock` 数据的容错，并增加请求超时和诊断日志。
+
 ## [1.7.3] - 2026-09-10
 
 ### 修复
