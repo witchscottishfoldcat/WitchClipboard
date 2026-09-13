@@ -62,3 +62,34 @@ jobs:
           $architecture = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'arm64' } else { 'x64' }
           $asset = "release/Witch-Clipboard-$version-$architecture-portable.zip"
           gh release upload "app-v$version" $asset --clobber
+
+  checksums:
+    needs: windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Matches the manually produced SHA256SUMS.txt shipped since 1.7.2: covers the six build
+      # artifacts in a fixed order, excludes latest.json. Fails loudly if asset names change so
+      # a release never ships with incomplete checksums.
+      - name: Generate and upload SHA256SUMS.txt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="app-v$version"
+          mkdir -p release/checksums && cd release/checksums
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            --pattern "Witch-Clipboard-$version-*-portable.zip" \
+            --pattern "Witch.Clipboard_$version_*-setup.exe" \
+            --pattern "Witch.Clipboard_$version_*-setup.exe.sig"
+          sha256sum \
+            "Witch-Clipboard-$version-arm64-portable.zip" \
+            "Witch-Clipboard-$version-x64-portable.zip" \
+            "Witch.Clipboard_${version}_arm64-setup.exe" \
+            "Witch.Clipboard_${version}_arm64-setup.exe.sig" \
+            "Witch.Clipboard_${version}_x64-setup.exe" \
+            "Witch.Clipboard_${version}_x64-setup.exe.sig" \
+            > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" SHA256SUMS.txt --clobber
