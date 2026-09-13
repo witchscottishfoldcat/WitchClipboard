@@ -54,7 +54,31 @@ export interface ClipItem {
   useCount: number
   createdAt: number
   lastUsedAt: number
+  /** 自由备注；可搜索 */
+  note?: string | null
+  /** 条目级持久热键，例如 "Ctrl+Alt+0"；未绑定为 null */
+  hotkey?: string | null
+  /** 所属分组；0 不是合法值（保留给「未分组」过滤） */
+  groupId?: number | null
 }
+
+/** 分组树节点；count 只统计直接挂在该节点上的条目 */
+export interface Group {
+  id: number
+  parentId: number | null
+  name: string
+  count: number
+}
+
+/** 粘贴变换；大小写类只作用于字母文本 */
+export type PasteTransform =
+  | 'plainText'
+  | 'upper'
+  | 'lower'
+  | 'capitalize'
+  | 'sentence'
+  | 'camel'
+  | 'trim'
 
 export interface ListQuery {
   /** 搜索关键词，空串表示不过滤 */
@@ -67,6 +91,8 @@ export interface ListQuery {
   tag?: string | null
   /** 只看置顶 */
   pinnedOnly?: boolean
+  /** 分组过滤；0 表示未分组，undefined 表示不过滤 */
+  groupId?: number | null
   limit?: number
   offset?: number
 }
@@ -139,7 +165,13 @@ export interface UpdateStatus {
 /** 自动粘贴的结果；失败时界面提示「已复制，请手动 Ctrl+V」 */
 export interface PasteOutcome {
   ok: boolean
-  reason?: 'no-native' | 'no-target' | 'focus-failed' | 'send-failed' | 'not-found'
+  reason?:
+    | 'no-native'
+    | 'no-target'
+    | 'focus-failed'
+    | 'target-elevated'
+    | 'send-failed'
+    | 'not-found'
 }
 
 export interface SecurityInfo {
@@ -229,6 +261,24 @@ export interface ClipboardApi {
   copy(id: number): Promise<void>
   /** 写入剪贴板 → 还原前台窗口 → 模拟 Ctrl+V */
   paste(id: number): Promise<PasteOutcome>
+  /** 多选批量粘贴：按传入顺序逐条写入并粘贴 */
+  pasteItems(ids: number[]): Promise<PasteOutcome>
+  /** 后台热键粘贴失败时推送原因（面板可见时用于提示） */
+  onPasteFailed(cb: (reason: string) => void): () => void
+  /** 粘贴变换：对文本条目做大小写/去空白等变换后粘贴 */
+  pasteTransformed(id: number, transform: PasteTransform): Promise<PasteOutcome>
+  /** 保存条目自由备注（纳入搜索） */
+  setItemNote(id: number, note: string | null): Promise<void>
+  /** 绑定/解绑条目级持久热键；冲突返回错误码 */
+  setItemHotkey(id: number, hotkey: string | null): Promise<void>
+  groups(): Promise<Group[]>
+  groupCreate(name: string, parentId: number | null): Promise<number>
+  groupRename(id: number, name: string): Promise<void>
+  groupDelete(id: number): Promise<void>
+  itemSetGroup(id: number, groupId: number | null): Promise<void>
+  /** 导出为明文 JSON（数据目录 exports/ 下），返回文件路径 */
+  exportItems(ids?: number[]): Promise<string>
+  importItems(path: string): Promise<string>
   /** 取全尺寸原图（data URL），非图片条目返回 null */
   imageDataUrl(id: number): Promise<string | null>
   /** 查找同一复制会话中关联的 Key、URL 和模型名称 */

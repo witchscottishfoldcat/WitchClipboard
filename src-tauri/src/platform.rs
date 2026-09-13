@@ -12,6 +12,7 @@ mod imp {
 
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GlobalFree, HWND, LPARAM, LRESULT, WPARAM},
+        Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
         System::{
             DataExchange::{
                 AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
@@ -26,23 +27,26 @@ mod imp {
                 KEY_SET_VALUE, REG_SZ,
             },
             Threading::{
-                OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+                AttachThreadInput, GetCurrentThreadId, OpenProcess, OpenProcessToken,
+                QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
             },
         },
         UI::{
             HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
             Input::KeyboardAndMouse::{
-                keybd_event, GetAsyncKeyState, KEYEVENTF_KEYUP, VK_CONTROL, VK_LBUTTON, VK_LWIN,
-                VK_MENU, VK_RWIN, VK_SHIFT,
+                GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
+                KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, VK_CONTROL, VK_LBUTTON,
+                VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
             },
             Shell::{DragQueryFileW, ShellExecuteW},
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, MessageBoxW,
-                PrivateExtractIconsW, RegisterClassW, SendMessageW, SetForegroundWindow,
-                TranslateMessage, HICON, HWND_MESSAGE, ICON_BIG, ICON_SMALL, MB_ICONERROR, MB_OK,
-                MSG, SM_CXICON, SM_CXSMICON, SW_SHOWNORMAL, WM_CLIPBOARDUPDATE, WM_SETICON,
-                WNDCLASSW,
+                BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+                GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, IsIconic, MessageBoxW,
+                PostMessageW, PrivateExtractIconsW, RegisterClassW, SendMessageW,
+                SetForegroundWindow, ShowWindow, SystemParametersInfoW, TranslateMessage,
+                HICON, HWND_MESSAGE, ICON_BIG, ICON_SMALL, MB_ICONERROR, MB_OK, MSG, SM_CXICON,
+                SM_CXSMICON, SPI_GETFOREGROUNDLOCKTIMEOUT, SPI_SETFOREGROUNDLOCKTIMEOUT,
+                SW_RESTORE, SW_SHOWNORMAL, WM_CLIPBOARDUPDATE, WM_QUIT, WM_SETICON, WNDCLASSW,
             },
         },
     };
@@ -66,7 +70,14 @@ mod imp {
     // Value-based flag: a DWORD of 0 opts out of history, any non-zero value is an explicit
     // opt-in. Presence alone cannot decide — the payload must be read.
     const HISTORY_FLAG_FORMAT: &str = "CanIncludeInClipboardHistory";
-    static CLIPBOARD_EVENTS: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+    // The clipboard listener must survive session events (remote desktop reconnects,
+    // clipboard service restarts) that can silently kill event delivery. It is tracked in
+    // a replaceable slot so the watchdog can tear it down and have it rebuilt.
+    struct ListenerHandle {
+        sender: mpsc::Sender<()>,
+        window: isize,
+    }
+    static CLIPBOARD_LISTENER: Mutex<Option<ListenerHandle>> = Mutex::new(None);
     // Store the extracted HICON handles for the process lifetime. Windows does not copy handles
     // passed through WM_SETICON, so destroying them while a window is alive would leave it with
     // dangling icons. The OS reclaims both handles when the process exits.
@@ -258,8 +269,10 @@ mod imp {
         lparam: LPARAM,
     ) -> LRESULT {
         if message == WM_CLIPBOARDUPDATE {
-            if let Some(sender) = CLIPBOARD_EVENTS.get() {
-                let _ = sender.send(());
+            if let Ok(listener) = CLIPBOARD_LISTENER.lock() {
+                if let Some(handle) = listener.as_ref() {
+                    let _ = handle.sender.send(());
+                }
             }
             return 0;
         }
@@ -272,9 +285,18 @@ mod imp {
 
     pub fn start_clipboard_notifications() -> Result<mpsc::Receiver<()>, String> {
         let (event_sender, event_receiver) = mpsc::channel();
-        CLIPBOARD_EVENTS
-            .set(event_sender)
-            .map_err(|_| "clipboard listener already started".to_string())?;
+        {
+            let mut listener = CLIPBOARD_LISTENER
+                .lock()
+                .map_err(|_| "clipboard listener lock poisoned".to_string())?;
+            if listener.is_some() {
+                return Err("clipboard listener already started".to_string());
+            }
+            *listener = Some(ListenerHandle {
+                sender: event_sender,
+                window: 0,
+            });
+        }
 
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         thread::spawn(move || unsafe {
@@ -313,6 +335,11 @@ mod imp {
                 let _ = ready_sender.send(Err("AddClipboardFormatListener failed".to_string()));
                 return;
             }
+            if let Ok(mut listener) = CLIPBOARD_LISTENER.lock() {
+                if let Some(handle) = listener.as_mut() {
+                    handle.window = hwnd as isize;
+                }
+            }
 
             let _ = ready_sender.send(Ok(()));
             let mut message: MSG = std::mem::zeroed();
@@ -322,13 +349,82 @@ mod imp {
             }
             RemoveClipboardFormatListener(hwnd);
             DestroyWindow(hwnd);
+            // Only clear the slot if it still names our window; a restart may already
+            // have replaced us.
+            if let Ok(mut listener) = CLIPBOARD_LISTENER.lock() {
+                if listener
+                    .as_ref()
+                    .is_some_and(|handle| handle.window == hwnd as isize)
+                {
+                    *listener = None;
+                }
+            }
         });
 
-        match ready_receiver.recv_timeout(Duration::from_secs(2)) {
+        let result = match ready_receiver.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(())) => Ok(event_receiver),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(format!("clipboard listener startup timed out: {error}")),
+        };
+        if result.is_err() {
+            // Startup failed or timed out: drop the pre-registered slot so a retry can
+            // rebuild from a clean state.
+            if let Ok(mut listener) = CLIPBOARD_LISTENER.lock() {
+                *listener = None;
+            }
         }
+        result
+    }
+
+    /// Tear the current listener down: the event channel closes (stopping the monitor) and
+    /// the message window is asked to unregister itself. A subsequent
+    /// `start_clipboard_notifications` builds a fresh pair.
+    pub fn stop_clipboard_notifications() {
+        let handle = CLIPBOARD_LISTENER
+            .lock()
+            .ok()
+            .and_then(|mut listener| listener.take());
+        if let Some(handle) = handle {
+            if handle.window != 0 {
+                unsafe { PostMessageW(handle.window as HWND, WM_QUIT, 0, 0) };
+            }
+        }
+    }
+
+    const WATCHDOG_FORMAT: &str = "WitchClipboardWatchdog";
+
+    /// Append a private marker format to the clipboard without emptying it. The user's
+    /// current content stays untouched while the resulting update event proves the whole
+    /// capture path alive.
+    pub fn write_clipboard_probe() -> bool {
+        let wide_name = wide(WATCHDOG_FORMAT);
+        let format = unsafe { RegisterClipboardFormatW(wide_name.as_ptr()) };
+        if format == 0 {
+            return false;
+        }
+        let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, 4) };
+        if memory.is_null() {
+            return false;
+        }
+        let locked = unsafe { GlobalLock(memory) };
+        if locked.is_null() {
+            unsafe { GlobalFree(memory) };
+            return false;
+        }
+        unsafe {
+            std::ptr::write_volatile(locked as *mut u32, 1);
+            GlobalUnlock(memory);
+        }
+        let Some(_guard) = ClipboardGuard::open() else {
+            unsafe { GlobalFree(memory) };
+            return false;
+        };
+        // No EmptyClipboard here on purpose: appending must not disturb current content.
+        if unsafe { SetClipboardData(format, memory as *mut c_void) }.is_null() {
+            unsafe { GlobalFree(memory) };
+            return false;
+        }
+        true
     }
 
     pub fn clipboard_sequence() -> u32 {
@@ -499,29 +595,153 @@ mod imp {
         if target == 0 {
             return Err("no-target");
         }
+        let target = target as HWND;
+        // A minimized target would accept the keystrokes invisibly; restore it first.
+        if unsafe { IsIconic(target) } != 0 {
+            unsafe { ShowWindow(target, SW_RESTORE) };
+        }
+        // Synthesized input is silently blocked by UIPI when crossing from a normal process
+        // into an elevated one; an explicit failure beats a paste that looks dead.
+        if window_pid_is_elevated(target) && !current_process_is_elevated() {
+            return Err("target-elevated");
+        }
+        // Let the panel finish hiding so it does not fight the upcoming z-order change.
         thread::sleep(Duration::from_millis(50));
-        let mut focused = unsafe { SetForegroundWindow(target as HWND) != 0 };
-        if !focused {
+        if !activate_target(target) {
             thread::sleep(Duration::from_millis(80));
-            focused = unsafe { SetForegroundWindow(target as HWND) != 0 };
+            if !activate_target(target) {
+                return Err("focus-failed");
+            }
         }
-        if !focused {
-            return Err("focus-failed");
-        }
-
-        thread::sleep(Duration::from_millis(60));
+        // The target is foreground now; give its message loop a beat to restore the focused
+        // control before the keystroke lands.
+        thread::sleep(Duration::from_millis(30));
         unsafe {
             for key in [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL] {
                 if (GetAsyncKeyState(key as i32) & i16::MIN) != 0 {
-                    keybd_event(key as u8, 0, KEYEVENTF_KEYUP, 0);
+                    send_key_event(key, KEYEVENTF_KEYUP);
                 }
             }
-            keybd_event(VK_CONTROL as u8, 0, 0, 0);
-            keybd_event(VK_V, 0, 0, 0);
-            keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0);
-            keybd_event(VK_CONTROL as u8, 0, KEYEVENTF_KEYUP, 0);
+            send_key_event(VK_CONTROL, 0);
+            send_key_event(VK_V as u16, 0);
+            send_key_event(VK_V as u16, KEYEVENTF_KEYUP);
+            send_key_event(VK_CONTROL, KEYEVENTF_KEYUP);
         }
         Ok(())
+    }
+
+    /// Force `target` into the foreground and wait for the activation to actually complete;
+    /// `SetForegroundWindow` alone is regularly refused when the caller does not own the
+    /// foreground (a panel that never received focus, background paste paths).
+    fn activate_target(target: HWND) -> bool {
+        unsafe {
+            // Neutralize the foreground lock timeout for the duration of the switch, then
+            // restore the user's original value.
+            let mut lock_timeout: usize = 0;
+            SystemParametersInfoW(
+                SPI_GETFOREGROUNDLOCKTIMEOUT,
+                0,
+                &mut lock_timeout as *mut _ as *mut c_void,
+                0,
+            );
+            SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, std::ptr::null_mut(), 0);
+
+            let foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+            let current_thread = GetCurrentThreadId();
+            let attached = foreground_thread != 0
+                && foreground_thread != current_thread
+                && AttachThreadInput(current_thread, foreground_thread, 1) != 0;
+
+            BringWindowToTop(target);
+            let requested = SetForegroundWindow(target) != 0;
+
+            if attached {
+                AttachThreadInput(current_thread, foreground_thread, 0);
+            }
+            SystemParametersInfoW(
+                SPI_SETFOREGROUNDLOCKTIMEOUT,
+                lock_timeout as u32,
+                std::ptr::null_mut(),
+                0,
+            );
+            if !requested {
+                return false;
+            }
+        }
+        // Activation is asynchronous and heavy applications finish it late; poll instead of
+        // trusting a fixed sleep.
+        for _ in 0..25 {
+            if unsafe { GetForegroundWindow() == target } {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { GetForegroundWindow() == target }
+    }
+
+    fn window_pid_is_elevated(window: HWND) -> bool {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(window, &mut pid) };
+        pid != 0 && pid_is_elevated(pid)
+    }
+
+    fn current_process_is_elevated() -> bool {
+        pid_is_elevated(std::process::id())
+    }
+
+    fn pid_is_elevated(pid: u32) -> bool {
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return false;
+            }
+            let mut token = std::ptr::null_mut();
+            let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+            CloseHandle(process);
+            if opened == 0 || token.is_null() {
+                return false;
+            }
+            let mut elevation = TOKEN_ELEVATION {
+                TokenIsElevated: 0,
+            };
+            let mut returned = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut elevation as *mut TOKEN_ELEVATION as *mut c_void,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            );
+            CloseHandle(token);
+            ok != 0 && elevation.TokenIsElevated != 0
+        }
+    }
+
+    /// Inject one keystroke via SendInput, preferring scan codes: applications that read
+    /// hardware scan codes (some terminals, nested remote sessions) ignore virtual-key
+    /// events. Keys without a base scan code fall back to the virtual-key path.
+    fn send_key_event(vk: u16, flags: u32) {
+        let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+        let mut input: INPUT = unsafe { std::mem::zeroed() };
+        input.r#type = INPUT_KEYBOARD;
+        input.Anonymous.ki = if scan != 0 {
+            KEYBDINPUT {
+                wVk: 0,
+                wScan: scan,
+                dwFlags: flags | KEYEVENTF_SCANCODE,
+                time: 0,
+                dwExtraInfo: 0,
+            }
+        } else {
+            KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            }
+        };
+        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
     }
 
     struct ClipboardGuard;
@@ -694,6 +914,10 @@ mod imp {
 
     pub fn start_clipboard_notifications() -> Result<mpsc::Receiver<()>, String> {
         Err("native clipboard notifications are only available on Windows".to_string())
+    }
+    pub fn stop_clipboard_notifications() {}
+    pub fn write_clipboard_probe() -> bool {
+        false
     }
     pub fn clipboard_sequence() -> u32 {
         0

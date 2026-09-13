@@ -15,6 +15,7 @@ use std::{
 
 use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tauri::{
@@ -35,7 +36,9 @@ mod settings;
 mod storage;
 mod webdav_sync;
 
-use model::{ListQuery, ListResult, PasteOutcome, Stats};
+use model::{
+    apply_paste_transform, Group, ListQuery, ListResult, PasteOutcome, PasteTransform, Stats,
+};
 use settings::SettingsStore;
 use storage::{NewItem, SqliteStore};
 
@@ -56,8 +59,13 @@ struct AppState {
     main_window_creating: AtomicBool,
     last_main_toggle_at: AtomicI64,
     quick_shortcuts: Mutex<HashMap<u32, usize>>,
+    /// 条目级持久热键：shortcut id → 条目 id。
+    item_hotkeys: Mutex<HashMap<u32, i64>>,
     hidden_at: AtomicI64,
     last_prune_at: AtomicI64,
+    /// Arrival time of the last clipboard event, in epoch ms. The watchdog compares it
+    /// against its probe time to decide whether event delivery is still alive.
+    last_clipboard_event_at: AtomicI64,
     window_hidden_at: Mutex<HashMap<String, i64>>,
     cross_device: cross_device::CrossDevice,
     webdav: webdav_sync::WebDavSync,
@@ -80,8 +88,10 @@ impl AppState {
             main_window_creating: AtomicBool::new(false),
             last_main_toggle_at: AtomicI64::new(0),
             quick_shortcuts: Mutex::new(HashMap::new()),
+            item_hotkeys: Mutex::new(HashMap::new()),
             hidden_at: AtomicI64::new(0),
             last_prune_at: AtomicI64::new(0),
+            last_clipboard_event_at: AtomicI64::new(0),
             window_hidden_at: Mutex::new(HashMap::new()),
             cross_device: cross_device::CrossDevice::new(phone_sender, &data_dir),
             webdav,
@@ -106,13 +116,30 @@ fn prune_if_due(state: &AppState) {
     let _ = state.store.prune(settings.max_items, settings.max_days);
 }
 
+/// Enforce the configured per-item size cap (0 = unlimited). Oversized content is skipped
+/// with a log line instead of silently growing the database; file entries store paths
+/// only and never pass through here.
+fn item_within_size_limit(state: &AppState, bytes: usize) -> bool {
+    let limit = state.settings.get().max_item_bytes;
+    if limit > 0 && bytes > limit {
+        eprintln!("skipping clipboard item of {bytes} bytes (limit {limit})");
+        false
+    } else {
+        true
+    }
+}
+
 fn insert_text(
     state: &AppState,
     text: String,
     html: Option<String>,
     source_app: Option<String>,
 ) -> bool {
-    if text.trim().is_empty() || text.len() > 1_000_000 {
+    if text.trim().is_empty() {
+        return false;
+    }
+    let payload_bytes = text.len() + html.as_deref().map_or(0, str::len);
+    if !item_within_size_limit(state, payload_bytes) {
         return false;
     }
     let hash = text_hash(&text);
@@ -293,6 +320,9 @@ fn insert_image(state: &AppState, rgba: image::RgbaImage, source_app: Option<Str
     {
         return false;
     }
+    if !item_within_size_limit(state, png.len()) {
+        return false;
+    }
     let hash = text_hash_bytes(&png);
     let Ok(blob_name) = state.store.put_blob(&hash, &png) else {
         return false;
@@ -370,66 +400,131 @@ fn read_with_retries<T>(
     }
 }
 
-fn wait_for_clipboard_settle(receiver: &mpsc::Receiver<()>) -> bool {
+fn wait_for_clipboard_settle(receiver: &mpsc::Receiver<()>, mut on_event: impl FnMut()) -> bool {
     if receiver.recv().is_err() {
         return false; // event channel closed, the monitor should stop
     }
-    while receiver.recv_timeout(CLIPBOARD_EVENT_SETTLE).is_ok() {}
+    on_event();
+    while receiver.recv_timeout(CLIPBOARD_EVENT_SETTLE).is_ok() {
+        on_event();
+    }
     true
 }
 
+const CLIPBOARD_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const CLIPBOARD_WATCHDOG_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn start_text_monitor(app: AppHandle, state: Arc<AppState>) {
-    let notifications = match platform::start_clipboard_notifications() {
-        Ok(notifications) => notifications,
-        Err(error) => {
-            eprintln!("native clipboard listener unavailable: {error}");
-            return;
-        }
-    };
-    thread::spawn(move || {
-        let mut last_sequence = platform::clipboard_sequence();
-        while wait_for_clipboard_settle(&notifications) {
-            // Own writes hold this gate until their sequence number is published. This removes
-            // the race where WM_CLIPBOARDUPDATE can arrive before the writer marks it ignored.
-            // 临界区只覆盖序列号比对与剪贴板读取；PNG 编码、哈希、入库都移出锁外，
-            // 否则复制大截图时快粘键路径会被编码耗时阻塞。
-            let capture = read_with_retries(
-                CLIPBOARD_READ_RETRIES,
-                CLIPBOARD_READ_RETRY_DELAY,
-                || {
-                    let _clipboard_guard = state
-                        .clipboard_gate
-                        .lock()
-                        .expect("clipboard gate lock poisoned");
-                    let sequence = platform::clipboard_sequence();
-                    if sequence == last_sequence
-                        || sequence == state.own_clipboard_sequence.load(Ordering::Acquire)
-                    {
-                        return ReadAttempt::Skip;
-                    }
-                    // The sequence number is consumed only once the outcome is decided;
-                    // leaving it untouched on Transient is what lets the retry re-read.
-                    match read_clipboard_update(&state) {
-                        ReadAttempt::Captured(capture) => {
-                            last_sequence = sequence;
-                            ReadAttempt::Captured(capture)
-                        }
-                        ReadAttempt::Skip => {
-                            last_sequence = sequence;
-                            ReadAttempt::Skip
-                        }
-                        ReadAttempt::Transient => ReadAttempt::Transient,
-                    }
-                },
-            );
-            let Some(capture) = capture else {
-                continue;
+    // Supervisor: whenever the listener dies (watchdog-ordered restart or channel loss),
+    // rebuild the listener/monitor pair after a short cool-down.
+    {
+        let app = app.clone();
+        let state = state.clone();
+        thread::spawn(move || loop {
+            let notifications = match platform::start_clipboard_notifications() {
+                Ok(notifications) => notifications,
+                Err(error) => {
+                    eprintln!("native clipboard listener unavailable: {error}");
+                    thread::sleep(Duration::from_secs(30));
+                    continue;
+                }
             };
-            if ingest_clipboard(&state, capture) {
-                let _ = app.emit("witchcat://changed", ());
+            state
+                .last_clipboard_event_at
+                .store(epoch_ms(), Ordering::Release);
+            let app = app.clone();
+            let state = state.clone();
+            let monitor = thread::spawn(move || monitor_clipboard(app, state, notifications));
+            let _ = monitor.join();
+            eprintln!("clipboard monitor stopped; restarting listener");
+            thread::sleep(Duration::from_millis(500));
+        });
+    }
+
+    // Event delivery can die silently after session events (remote desktop reconnects,
+    // clipboard service restarts). A periodic probe verifies the whole path end to end and
+    // orders a rebuild when no event comes back.
+    thread::spawn(move || loop {
+        thread::sleep(CLIPBOARD_WATCHDOG_INTERVAL);
+        let started = epoch_ms();
+        if !probe_clipboard(&state) {
+            continue; // could not even write the probe; retry on the next tick
+        }
+        while epoch_ms() - started < CLIPBOARD_WATCHDOG_ACK_TIMEOUT.as_millis() as i64 {
+            if state.last_clipboard_event_at.load(Ordering::Acquire) >= started {
+                break;
             }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if state.last_clipboard_event_at.load(Ordering::Acquire) < started {
+            eprintln!("clipboard watchdog: probe produced no event; restarting listener");
+            platform::stop_clipboard_notifications();
         }
     });
+}
+
+/// Append a private marker format to the clipboard as an own write: the monitor skips
+/// ingesting it while still receiving the update event, which is exactly what the
+/// watchdog needs to observe.
+fn probe_clipboard(state: &AppState) -> bool {
+    let _guard = state
+        .clipboard_gate
+        .lock()
+        .expect("clipboard gate lock poisoned");
+    if !platform::write_clipboard_probe() {
+        return false;
+    }
+    state
+        .own_clipboard_sequence
+        .store(platform::clipboard_sequence(), Ordering::Release);
+    true
+}
+
+fn monitor_clipboard(app: AppHandle, state: Arc<AppState>, notifications: mpsc::Receiver<()>) {
+    let mut last_sequence = platform::clipboard_sequence();
+    while wait_for_clipboard_settle(&notifications, || {
+        state.last_clipboard_event_at.store(epoch_ms(), Ordering::Release);
+    }) {
+        // Own writes hold this gate until their sequence number is published. This removes
+        // the race where WM_CLIPBOARDUPDATE can arrive before the writer marks it ignored.
+        // 临界区只覆盖序列号比对与剪贴板读取；PNG 编码、哈希、入库都移出锁外，
+        // 否则复制大截图时快粘键路径会被编码耗时阻塞。
+        let capture = read_with_retries(
+            CLIPBOARD_READ_RETRIES,
+            CLIPBOARD_READ_RETRY_DELAY,
+            || {
+                let _clipboard_guard = state
+                    .clipboard_gate
+                    .lock()
+                    .expect("clipboard gate lock poisoned");
+                let sequence = platform::clipboard_sequence();
+                if sequence == last_sequence
+                    || sequence == state.own_clipboard_sequence.load(Ordering::Acquire)
+                {
+                    return ReadAttempt::Skip;
+                }
+                // The sequence number is consumed only once the outcome is decided;
+                // leaving it untouched on Transient is what lets the retry re-read.
+                match read_clipboard_update(&state) {
+                    ReadAttempt::Captured(capture) => {
+                        last_sequence = sequence;
+                        ReadAttempt::Captured(capture)
+                    }
+                    ReadAttempt::Skip => {
+                        last_sequence = sequence;
+                        ReadAttempt::Skip
+                    }
+                    ReadAttempt::Transient => ReadAttempt::Transient,
+                }
+            },
+        );
+        let Some(capture) = capture else {
+            continue;
+        };
+        if ingest_clipboard(&state, capture) {
+            let _ = app.emit("witchcat://changed", ());
+        }
+    }
 }
 
 fn epoch_ms() -> i64 {
@@ -835,6 +930,22 @@ fn register_shortcuts(
             }
         }
     }
+    // 条目级持久热键跟随其余热键一起重建；单条注册失败（与系统或其他应用冲突）
+    // 只让该条失效，不影响其他热键。
+    if let Ok(mut item_hotkeys) = state.item_hotkeys.lock() {
+        item_hotkeys.clear();
+        if let Ok(assignments) = state.store.item_hotkeys() {
+            for (item_id, expression) in assignments {
+                if let Ok(shortcut) = expression.parse::<Shortcut>() {
+                    if app.global_shortcut().register(shortcut).is_ok() {
+                        item_hotkeys.insert(shortcut.id(), item_id);
+                    } else {
+                        eprintln!("item hotkey {expression} could not be registered");
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -850,17 +961,27 @@ fn handle_shortcut(app: &AppHandle, shortcut: &Shortcut) {
             return;
         }
     }
+    // 快粘与条目热键共用「以当前前台窗口为粘贴目标」的语义。
+    if let Some(hwnd) = platform::foreground_window() {
+        if !platform::window_process_id(hwnd).is_some_and(|pid| pid == std::process::id()) {
+            state.target_hwnd.store(hwnd, Ordering::Release);
+        }
+    }
+    if let Some(item_id) = state
+        .item_hotkeys
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&shortcut.id()).copied())
+    {
+        paste_item_by_id_in_background(app, &state, item_id);
+        return;
+    }
     let index = state
         .quick_shortcuts
         .lock()
         .ok()
         .and_then(|map| map.get(&shortcut.id()).copied());
     let Some(index) = index else { return };
-    if let Some(hwnd) = platform::foreground_window() {
-        if !platform::window_process_id(hwnd).is_some_and(|pid| pid == std::process::id()) {
-            state.target_hwnd.store(hwnd, Ordering::Release);
-        }
-    }
     let Ok(list) = state.store.list(&ListQuery {
         limit: Some(9),
         ..Default::default()
@@ -870,16 +991,435 @@ fn handle_shortcut(app: &AppHandle, shortcut: &Shortcut) {
     let Some(item) = list.items.get(index) else {
         return;
     };
-    let id = item.id;
-    let owned = state.inner().clone();
+    paste_item_by_id_in_background(app, &state, item.id);
+}
+
+/// 后台热键粘贴：写条目 → 切回目标 → 模拟 Ctrl+V。失败时向渲染层广播原因，
+/// 让可见面板弹提示（面板不可见时静默，仅日志）。
+fn paste_item_by_id_in_background(app: &AppHandle, state: &Arc<AppState>, id: i64) {
+    let owned = state.clone();
     let app = app.clone();
     thread::spawn(move || {
         if write_item(&owned, id).is_ok() {
             let target = owned.target_hwnd.load(Ordering::Acquire);
-            let _ = platform::restore_and_paste(target);
+            if let Err(reason) = platform::restore_and_paste(target) {
+                eprintln!("background paste failed: {reason}");
+                let _ = app.emit("witchcat://paste-failed", reason);
+            }
             let _ = app.emit("witchcat://changed", ());
         }
     });
+}
+
+/// 以 own-write 语义写纯文本到剪贴板：持门控锁直到序列号发布，采集侧不会误收。
+fn write_text_to_clipboard(state: &AppState, text: &str) -> Result<(), String> {
+    let _guard = state
+        .clipboard_gate
+        .lock()
+        .map_err(|_| "clipboard gate lock poisoned".to_string())?;
+    Clipboard::new()
+        .and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+        .map_err(|error| error.to_string())?;
+    state
+        .own_clipboard_sequence
+        .store(platform::clipboard_sequence(), Ordering::Release);
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportItem {
+    kind: String,
+    text: Option<String>,
+    html: Option<String>,
+    preview: String,
+    auto_kind: String,
+    hash: String,
+    pinned: bool,
+    note: Option<String>,
+    created_at: i64,
+    source_app: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    bytes: usize,
+    image_png: Option<String>,
+    thumb: Option<String>,
+}
+
+/// 导出为明文 JSON：文件里是可读的剪贴板内容，写入磁盘即脱离加密保护。
+/// 前端必须先取得用户确认。热键不导出——导入不应静默重绑全局按键。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportFile {
+    format: String,
+    version: u32,
+    exported_at: i64,
+    items: Vec<ExportItem>,
+}
+
+#[tauri::command]
+fn groups_list(state: State<'_, Arc<AppState>>) -> Result<Vec<Group>, String> {
+    state.store.groups().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn group_create(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    parent_id: Option<i64>,
+) -> Result<i64, String> {
+    state
+        .store
+        .group_create(&name, parent_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn group_rename(state: State<'_, Arc<AppState>>, id: i64, name: String) -> Result<(), String> {
+    state
+        .store
+        .group_rename(id, &name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn group_delete(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    state.store.group_delete(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn item_set_group(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    group_id: Option<i64>,
+) -> Result<(), String> {
+    state
+        .store
+        .item_set_group(id, group_id)
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("witchcat://changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn set_item_note(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    note: Option<String>,
+) -> Result<(), String> {
+    state
+        .store
+        .set_item_note(id, note.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_item_hotkey(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    hotkey: Option<String>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let clean = hotkey
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(expression) = clean {
+            let shortcut = expression
+                .parse::<Shortcut>()
+                .map_err(|_| "hotkey-invalid".to_string())?;
+            let settings = state.settings.get();
+            let reserved = expression.eq_ignore_ascii_case(&settings.hotkey)
+                || expression.eq_ignore_ascii_case(MINI_HOTKEY)
+                || (1..=9).any(|digit| {
+                    format!("{}+{}", settings.quick_paste_modifiers, digit)
+                        .eq_ignore_ascii_case(expression)
+                });
+            if reserved {
+                return Err("hotkey-reserved".to_string());
+            }
+            // 与其他条目的热键重复在入库前拒绝（库级唯一索引是最后防线）。
+            let duplicate = state
+                .store
+                .item_hotkeys()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .any(|(other, assigned)| {
+                    *other != id && assigned.eq_ignore_ascii_case(expression)
+                });
+            if duplicate {
+                return Err("hotkey-conflict".to_string());
+            }
+            // 幂等设置同值直接成功，避免「已注册」被误报为冲突。
+            let unchanged = state
+                .store
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .and_then(|item| item.hotkey)
+                .is_some_and(|current| current.eq_ignore_ascii_case(expression));
+            if !unchanged {
+                // 抢先试注册一次，把「被其他程序占用」提前暴露给用户。
+                if app.global_shortcut().register(shortcut).is_err() {
+                    return Err("hotkey-conflict".to_string());
+                }
+                let _ = app.global_shortcut().unregister(shortcut);
+            }
+        }
+        state
+            .store
+            .set_item_hotkey(id, clean)
+            .map_err(|e| e.to_string())?;
+        // 全量重建，保证注册表与库一致（新分配或清空都覆盖）。允许回退：
+        // 重建瞬间主热键若被其他程序抢占，宁可降级到备用键也不能丢掉面板呼出。
+        register_shortcuts(&app, &state, true).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn paste_items(
+    window: WebviewWindow,
+    state: State<'_, Arc<AppState>>,
+    ids: Vec<i64>,
+) -> Result<PasteOutcome, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if ids.is_empty() {
+            return Ok(PasteOutcome {
+                ok: false,
+                reason: Some("not-found"),
+            });
+        }
+        let hidden = state.settings.get().hide_after_paste;
+        if hidden {
+            hide_window(&window);
+        }
+        let mut failure: Option<&'static str> = None;
+        for (position, id) in ids.iter().enumerate() {
+            if position > 0 {
+                // 目标应用消化一次粘贴需要时间，条目之间留出间隔。
+                thread::sleep(Duration::from_millis(120));
+            }
+            if write_item(&state, *id).is_err() {
+                failure = Some("not-found");
+                continue;
+            }
+            let target = state.target_hwnd.load(Ordering::Acquire);
+            if let Err(reason) = platform::restore_and_paste(target) {
+                failure = Some(reason);
+                break; // 目标窗口已不可用，继续贴没有意义
+            }
+        }
+        match failure {
+            None => Ok(PasteOutcome {
+                ok: true,
+                reason: None,
+            }),
+            Some(reason) => {
+                if hidden {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                Ok(PasteOutcome {
+                    ok: false,
+                    reason: Some(reason),
+                })
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn paste_transformed(
+    window: WebviewWindow,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    transform: PasteTransform,
+) -> Result<PasteOutcome, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let item = state
+            .store
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not-found".to_string())?;
+        let text = item.text.as_deref().ok_or_else(|| "not-found".to_string())?;
+        let transformed = apply_paste_transform(text, transform);
+        write_text_to_clipboard(&state, &transformed)?;
+        let hidden = state.settings.get().hide_after_paste;
+        if hidden {
+            hide_window(&window);
+        }
+        let target = state.target_hwnd.load(Ordering::Acquire);
+        Ok(match platform::restore_and_paste(target) {
+            Ok(()) => PasteOutcome {
+                ok: true,
+                reason: None,
+            },
+            Err(reason) => {
+                if hidden {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                PasteOutcome {
+                    ok: false,
+                    reason: Some(reason),
+                }
+            }
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn export_items(
+    state: State<'_, Arc<AppState>>,
+    ids: Option<Vec<i64>>,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let items = match ids {
+            Some(ids) if !ids.is_empty() => {
+                let mut collected = Vec::new();
+                for id in ids {
+                    if let Some(item) = state.store.get(id).map_err(|e| e.to_string())? {
+                        collected.push(item);
+                    }
+                }
+                collected
+            }
+            _ => state
+                .store
+                .list(&ListQuery {
+                    limit: Some(1000),
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())?
+                .items,
+        };
+        let mut exported = Vec::with_capacity(items.len());
+        for item in items {
+            let image_png = if item.kind == "image" {
+                state
+                    .store
+                    .image_png(item.id)
+                    .map_err(|e| e.to_string())?
+                    .map(|png| BASE64.encode(png))
+            } else {
+                None
+            };
+            exported.push(ExportItem {
+                kind: item.kind,
+                text: item.text,
+                html: item.html,
+                preview: item.preview,
+                auto_kind: item.auto_kind,
+                hash: item.hash,
+                pinned: item.pinned,
+                note: item.note,
+                created_at: item.created_at,
+                source_app: item.source_app,
+                width: item.width,
+                height: item.height,
+                bytes: item.bytes,
+                image_png,
+                thumb: item.thumb,
+            });
+        }
+        let payload = ExportFile {
+            format: "witch-clipboard-export".to_string(),
+            version: 1,
+            exported_at: epoch_ms(),
+            items: exported,
+        };
+        let directory = state.store.data_dir().join("exports");
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let path = directory.join(format!("witch-export-{}.json", epoch_ms()));
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(path.display().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn import_items(state: State<'_, Arc<AppState>>, path: String) -> Result<String, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let payload: ExportFile =
+            serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+        if payload.format != "witch-clipboard-export" {
+            return Err("unsupported format".to_string());
+        }
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for entry in payload.items {
+            let blob_name = match entry.image_png.as_deref() {
+                Some(encoded) => {
+                    let png = BASE64.decode(encoded).map_err(|e| e.to_string())?;
+                    Some(
+                        state
+                            .store
+                            .put_blob(&entry.hash, &png)
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+                None => None,
+            };
+            let thumb = entry
+                .thumb
+                .as_deref()
+                .and_then(|data| data.strip_prefix("data:image/png;base64,"))
+                .and_then(|encoded| BASE64.decode(encoded).ok());
+            let preview = if entry.preview.is_empty() {
+                classify::make_preview(entry.text.as_deref().unwrap_or(""), 160)
+            } else {
+                entry.preview
+            };
+            let new_item = NewItem {
+                kind: entry.kind.clone(),
+                text: entry.text.clone(),
+                html: entry.html.clone(),
+                preview,
+                auto_kind: entry.auto_kind.clone(),
+                hash: entry.hash.clone(),
+                blob_name,
+                thumb,
+                width: entry.width,
+                height: entry.height,
+                bytes: entry.bytes,
+                source_app: entry.source_app.clone(),
+            };
+            let (id, inserted) = state.store.add(new_item).map_err(|e| e.to_string())?;
+            if inserted {
+                added += 1;
+                if entry.pinned {
+                    let _ = state.store.toggle_pin(id);
+                }
+                if entry.note.as_deref().is_some_and(|note| !note.trim().is_empty()) {
+                    let _ = state.store.set_item_note(id, entry.note.as_deref());
+                }
+            } else {
+                skipped += 1;
+            }
+        }
+        Ok(format!("导入完成：新增 {added} 条，跳过重复 {skipped} 条"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1194,6 +1734,9 @@ fn toggle_pin(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Resul
 fn remove_item(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     state.store.remove(id).map_err(|error| error.to_string())?;
     let _ = app.emit("witchcat://changed", ());
+    // 条目可能绑着热键；重建注册表避免悬挂映射（允许回退，理由同 set_item_hotkey）。
+    let owned = state.inner().clone();
+    let _ = register_shortcuts(&app, &owned, true);
     Ok(())
 }
 
@@ -1359,6 +1902,8 @@ fn main() {
             clear_all,
             copy_item,
             paste_item,
+            paste_items,
+            paste_transformed,
             clipboard_image,
             clipboard_related,
             get_settings,
@@ -1369,6 +1914,15 @@ fn main() {
             reveal_file,
             open_data_dir,
             open_external,
+            groups_list,
+            group_create,
+            group_rename,
+            group_delete,
+            item_set_group,
+            set_item_note,
+            set_item_hotkey,
+            export_items,
+            import_items,
             cross_device_start,
             cross_device_stop,
             cross_device_status,
@@ -1517,8 +2071,10 @@ mod tests {
             main_window_creating: AtomicBool::new(false),
             last_main_toggle_at: AtomicI64::new(0),
             quick_shortcuts: Mutex::new(HashMap::new()),
+            item_hotkeys: Mutex::new(HashMap::new()),
             hidden_at: AtomicI64::new(0),
             last_prune_at: AtomicI64::new(0),
+            last_clipboard_event_at: AtomicI64::new(0),
             window_hidden_at: Mutex::new(HashMap::new()),
             cross_device: {
                 let (tx, _) = mpsc::channel();
@@ -1609,6 +2165,8 @@ mod tests {
         // The drain loop treats a disconnected channel as "settled", so the producer must
         // stay alive through the whole window — in production the listener thread holds it.
         let keepalive = sender.clone();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
         let sender_thread = thread::spawn(move || {
             sender.send(()).unwrap();
             thread::sleep(Duration::from_millis(20));
@@ -1617,16 +2175,82 @@ mod tests {
             sender.send(()).unwrap();
         });
         let started = std::time::Instant::now();
-        assert!(wait_for_clipboard_settle(&receiver));
+        assert!(wait_for_clipboard_settle(&receiver, || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
         // The last event landed well inside the settle window, so the full window must
         // have elapsed before reading was allowed.
         assert!(started.elapsed() >= CLIPBOARD_EVENT_SETTLE);
+        assert_eq!(seen.load(Ordering::Relaxed), 3);
         sender_thread.join().unwrap();
         drop(keepalive);
 
         let (closed_sender, receiver) = mpsc::channel();
         drop(closed_sender);
-        assert!(!wait_for_clipboard_settle(&receiver));
+        assert!(!wait_for_clipboard_settle(&receiver, || {}));
+    }
+
+    #[test]
+    fn oversized_items_respect_the_configured_byte_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        state
+            .settings
+            .save_patch(serde_json::json!({ "maxItemBytes": 64 }))
+            .unwrap();
+
+        assert!(!insert_text(
+            &state,
+            "x".repeat(65),
+            None,
+            Some("tester.exe".to_string())
+        ));
+        assert!(state.store.list(&ListQuery::default()).unwrap().items.is_empty());
+
+        assert!(insert_text(
+            &state,
+            "fits".to_string(),
+            None,
+            Some("tester.exe".to_string())
+        ));
+        assert_eq!(state.store.list(&ListQuery::default()).unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn paste_transforms_cover_case_shapes_and_trim() {
+        assert_eq!(
+            apply_paste_transform("hello WORLD", PasteTransform::Upper),
+            "HELLO WORLD"
+        );
+        assert_eq!(
+            apply_paste_transform("Hello World", PasteTransform::Lower),
+            "hello world"
+        );
+        assert_eq!(
+            apply_paste_transform("hello world", PasteTransform::Capitalize),
+            "Hello World"
+        );
+        assert_eq!(
+            apply_paste_transform("hello. wORLD? again", PasteTransform::Sentence),
+            "Hello. World? Again"
+        );
+        assert_eq!(
+            apply_paste_transform("  padded\ttext  ", PasteTransform::Trim),
+            "padded\ttext"
+        );
+        assert_eq!(
+            apply_paste_transform("hello world again", PasteTransform::Camel),
+            "helloWorldAgain"
+        );
+        // 纯文本是恒等；无字母文本的大小写变换也是恒等（对中文友好）
+        assert_eq!(
+            apply_paste_transform("<b>keep</b>", PasteTransform::PlainText),
+            "<b>keep</b>"
+        );
+        assert_eq!(
+            apply_paste_transform("中文内容", PasteTransform::Upper),
+            "中文内容"
+        );
     }
 
     /// This test intentionally mutates the real Windows clipboard. Keep it ignored and run it

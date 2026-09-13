@@ -13,10 +13,10 @@ use thiserror::Error;
 
 use crate::{
     crypto::{CryptoError, KeyMaterial},
-    model::{ClipItem, ListQuery, ListResult, Stats, SyncItem, SyncTombstone},
+    model::{ClipItem, Group, ListQuery, ListResult, Stats, SyncItem, SyncTombstone},
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const TAG_SEPARATOR: char = '\u{1f}';
 const SELECT_BASE: &str = r#"
 SELECT i.*, (
@@ -31,11 +31,20 @@ CREATE TABLE items (
   preview TEXT NOT NULL DEFAULT '', auto_kind TEXT NOT NULL DEFAULT 'plain',
   hash TEXT NOT NULL UNIQUE, blob_name TEXT, thumb BLOB, width INTEGER, height INTEGER,
   bytes INTEGER NOT NULL DEFAULT 0, source_app TEXT, pinned INTEGER NOT NULL DEFAULT 0,
-  use_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL
+  use_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,
+  note TEXT, hotkey TEXT, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL
 );
 CREATE INDEX idx_items_order ON items(pinned DESC, last_used_at DESC);
 CREATE INDEX idx_items_kind ON items(kind);
 CREATE INDEX idx_items_auto_kind ON items(auto_kind);
+CREATE INDEX idx_items_group ON items(group_id);
+CREATE UNIQUE INDEX idx_items_hotkey ON items(hotkey) WHERE hotkey IS NOT NULL;
+CREATE TABLE groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  sort INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
 CREATE TABLE item_tags (
   item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
@@ -48,17 +57,17 @@ CREATE TABLE sync_tombstones (
   deleted_at INTEGER NOT NULL
 );
 CREATE VIRTUAL TABLE items_fts USING fts5(
-  text, preview, content='items', content_rowid='id', tokenize='trigram'
+  text, preview, note, content='items', content_rowid='id', tokenize='trigram'
 );
 CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
-  INSERT INTO items_fts(rowid, text, preview) VALUES (new.id, new.text, new.preview);
+  INSERT INTO items_fts(rowid, text, preview, note) VALUES (new.id, new.text, new.preview, new.note);
 END;
 CREATE TRIGGER items_ad AFTER DELETE ON items BEGIN
-  INSERT INTO items_fts(items_fts, rowid, text, preview) VALUES ('delete', old.id, old.text, old.preview);
+  INSERT INTO items_fts(items_fts, rowid, text, preview, note) VALUES ('delete', old.id, old.text, old.preview, old.note);
 END;
-CREATE TRIGGER items_au AFTER UPDATE OF text, preview ON items BEGIN
-  INSERT INTO items_fts(items_fts, rowid, text, preview) VALUES ('delete', old.id, old.text, old.preview);
-  INSERT INTO items_fts(rowid, text, preview) VALUES (new.id, new.text, new.preview);
+CREATE TRIGGER items_au AFTER UPDATE OF text, preview, note ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, text, preview, note) VALUES ('delete', old.id, old.text, old.preview, old.note);
+  INSERT INTO items_fts(rowid, text, preview, note) VALUES (new.id, new.text, new.preview, new.note);
 END;
 "#;
 
@@ -178,6 +187,11 @@ impl SqliteStore {
     }
 
     pub fn list(&self, query: &ListQuery) -> Result<ListResult, StorageError> {
+        // 子树解析要访问连接，必须在 list 自己加锁前完成，否则重入死锁。
+        let group_subtree = match query.group_id {
+            Some(0) | None => None,
+            Some(group_id) => Some(self.group_subtree_ids(group_id)?),
+        };
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut clauses = Vec::<String>::new();
         let mut values = Vec::<SqlValue>::new();
@@ -191,6 +205,24 @@ impl SqliteStore {
         }
         if query.pinned_only.unwrap_or(false) {
             clauses.push("i.pinned=1".to_string());
+        }
+        if let Some(group_id) = query.group_id {
+            if group_id == 0 {
+                // 0 是保留值：未分组。
+                clauses.push("i.group_id IS NULL".to_string());
+            } else if let Some(ids) = group_subtree {
+                if ids.is_empty() {
+                    clauses.push("1=0".to_string());
+                } else {
+                    clauses.push(format!(
+                        "i.group_id IN ({})",
+                        ids.iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                }
+            }
         }
         if let Some(tag) = query.tag.as_ref().filter(|value| !value.is_empty()) {
             clauses.push("EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id WHERE it.item_id=i.id AND t.name=?)".to_string());
@@ -271,6 +303,133 @@ impl SqliteStore {
         Ok(tags)
     }
 
+    // ---- 分组 / 备注 / 条目热键 ----
+
+    pub fn groups(&self) -> Result<Vec<Group>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT g.id, g.parent_id, g.name, (SELECT count(*) FROM items i WHERE i.group_id=g.id)
+             FROM groups g ORDER BY g.sort, g.id",
+        )?;
+        let groups = statement
+            .query_map([], |row| {
+                Ok(Group {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    name: row.get(2)?,
+                    count: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(groups)
+    }
+
+    pub fn group_create(&self, name: &str, parent_id: Option<i64>) -> Result<i64, StorageError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(StorageError::Io(std::io::Error::other("group name is empty")));
+        }
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        // 不允许把分组挂到不存在的父级或自己后代下面，避免成环。
+        if let Some(parent) = parent_id {
+            let exists: bool = connection
+                .query_row("SELECT 1 FROM groups WHERE id=?1", [parent], |_| Ok(true))
+                .unwrap_or(false);
+            if !exists {
+                return Err(StorageError::Io(std::io::Error::other("parent group not found")));
+            }
+        }
+        connection.execute(
+            "INSERT INTO groups(parent_id, name) VALUES (?1, ?2)",
+            params![parent_id, name],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn group_rename(&self, id: i64, name: &str) -> Result<(), StorageError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(StorageError::Io(std::io::Error::other("group name is empty")));
+        }
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute("UPDATE groups SET name=?2 WHERE id=?1", params![id, name])?;
+        Ok(())
+    }
+
+    pub fn group_delete(&self, id: i64) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        // 外键 ON DELETE SET NULL/CASCADE 负责条目与子分组的归属。
+        connection.execute("DELETE FROM groups WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    fn group_subtree_ids(&self, root: i64) -> Result<Vec<i64>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut frontier = vec![root];
+        let mut visited = Vec::new();
+        while let Some(current) = frontier.pop() {
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.push(current);
+            let mut statement = connection.prepare("SELECT id FROM groups WHERE parent_id=?1")?;
+            let children = statement
+                .query_map([current], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            frontier.extend(children);
+        }
+        Ok(visited)
+    }
+
+    pub fn item_set_group(&self, id: i64, group_id: Option<i64>) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE items SET group_id=?2 WHERE id=?1",
+            params![id, group_id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Io(std::io::Error::other("item not found")));
+        }
+        Ok(())
+    }
+
+    pub fn set_item_note(&self, id: i64, note: Option<&str>) -> Result<(), StorageError> {
+        let clean = note.map(str::trim).filter(|value| !value.is_empty());
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE items SET note=?2 WHERE id=?1",
+            params![id, clean],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Io(std::io::Error::other("item not found")));
+        }
+        Ok(())
+    }
+
+    /// 设置条目热键；热键字符串全局唯一（部分唯一索引保证），重复分配返回错误。
+    pub fn set_item_hotkey(&self, id: i64, hotkey: Option<&str>) -> Result<(), StorageError> {
+        let clean = hotkey.map(str::trim).filter(|value| !value.is_empty());
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE items SET hotkey=?2 WHERE id=?1",
+            params![id, clean],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Io(std::io::Error::other("item not found")));
+        }
+        Ok(())
+    }
+
+    pub fn item_hotkeys(&self) -> Result<Vec<(i64, String)>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement =
+            connection.prepare("SELECT id, hotkey FROM items WHERE hotkey IS NOT NULL")?;
+        let pairs = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(pairs)
+    }
+
     pub fn set_tags(&self, id: i64, names: &[String]) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction()?;
@@ -349,10 +508,10 @@ impl SqliteStore {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let deleted_at = now_ms();
         connection.execute(
-            "INSERT INTO sync_tombstones(hash,deleted_at) SELECT hash,?1 FROM items WHERE pinned=0 ON CONFLICT(hash) DO UPDATE SET deleted_at=max(deleted_at,excluded.deleted_at)",
+            "INSERT INTO sync_tombstones(hash,deleted_at) SELECT hash,?1 FROM items WHERE pinned=0 AND hotkey IS NULL ON CONFLICT(hash) DO UPDATE SET deleted_at=max(deleted_at,excluded.deleted_at)",
             [deleted_at],
         )?;
-        connection.execute_batch("DELETE FROM items WHERE pinned=0; DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM item_tags);")?;
+        connection.execute_batch("DELETE FROM items WHERE pinned=0 AND hotkey IS NULL; DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM item_tags);")?;
         drop(connection);
         self.gc_orphan_blobs()?;
         Ok(())
@@ -373,20 +532,20 @@ impl SqliteStore {
         if max_days > 0 {
             let cutoff = now_ms() - max_days as i64 * 86_400_000;
             transaction.execute(
-                "INSERT INTO sync_tombstones(hash,deleted_at) SELECT hash,?1 FROM items WHERE pinned=0 AND last_used_at<?2 ON CONFLICT(hash) DO UPDATE SET deleted_at=max(deleted_at,excluded.deleted_at)",
+                "INSERT INTO sync_tombstones(hash,deleted_at) SELECT hash,?1 FROM items WHERE pinned=0 AND hotkey IS NULL AND last_used_at<?2 ON CONFLICT(hash) DO UPDATE SET deleted_at=max(deleted_at,excluded.deleted_at)",
                 params![now_ms(), cutoff],
             )?;
             removed += transaction.execute(
-                "DELETE FROM items WHERE pinned=0 AND last_used_at<?1",
+                "DELETE FROM items WHERE pinned=0 AND hotkey IS NULL AND last_used_at<?1",
                 [cutoff],
             )?;
         }
         if max_items > 0 {
             transaction.execute(
-                "INSERT INTO sync_tombstones(hash,deleted_at) SELECT hash,?1 FROM items WHERE pinned=0 AND id NOT IN (SELECT id FROM items WHERE pinned=0 ORDER BY last_used_at DESC LIMIT ?2) ON CONFLICT(hash) DO UPDATE SET deleted_at=max(deleted_at,excluded.deleted_at)",
+                "INSERT INTO sync_tombstones(hash,deleted_at) SELECT hash,?1 FROM items WHERE pinned=0 AND hotkey IS NULL AND id NOT IN (SELECT id FROM items WHERE pinned=0 AND hotkey IS NULL ORDER BY last_used_at DESC LIMIT ?2) ON CONFLICT(hash) DO UPDATE SET deleted_at=max(deleted_at,excluded.deleted_at)",
                 params![now_ms(), max_items as i64],
             )?;
-            removed+=transaction.execute("DELETE FROM items WHERE pinned=0 AND id NOT IN (SELECT id FROM items WHERE pinned=0 ORDER BY last_used_at DESC LIMIT ?1)",[max_items as i64])?;
+            removed+=transaction.execute("DELETE FROM items WHERE pinned=0 AND hotkey IS NULL AND id NOT IN (SELECT id FROM items WHERE pinned=0 AND hotkey IS NULL ORDER BY last_used_at DESC LIMIT ?1)",[max_items as i64])?;
         }
         transaction.execute(
             "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM item_tags)",
@@ -698,6 +857,9 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<ClipItem> {
         use_count: row.get::<_, i64>("use_count")? as u32,
         created_at: row.get("created_at")?,
         last_used_at: row.get("last_used_at")?,
+        note: row.get("note")?,
+        hotkey: row.get("hotkey")?,
+        group_id: row.get("group_id")?,
     })
 }
 
@@ -731,6 +893,40 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             if version < 6 {
                 connection.execute_batch(
                     "CREATE TABLE IF NOT EXISTS sync_tombstones (hash TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL);",
+                )?;
+            }
+            if version < 7 {
+                connection.execute_batch(
+                    "ALTER TABLE items ADD COLUMN note TEXT;
+                     ALTER TABLE items ADD COLUMN hotkey TEXT;
+                     CREATE TABLE groups (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       parent_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+                       name TEXT NOT NULL,
+                       sort INTEGER NOT NULL DEFAULT 0
+                     );
+                     ALTER TABLE items ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL;
+                     CREATE INDEX idx_items_group ON items(group_id);
+                     CREATE UNIQUE INDEX idx_items_hotkey ON items(hotkey) WHERE hotkey IS NOT NULL;",
+                )?;
+                // 备注纳入全文索引需要重建 FTS 表与触发器；trigram 对中文友好。
+                connection.execute_batch(
+                    "DROP TRIGGER items_ai; DROP TRIGGER items_ad; DROP TRIGGER items_au;
+                     DROP TABLE items_fts;
+                     CREATE VIRTUAL TABLE items_fts USING fts5(
+                       text, preview, note, content='items', content_rowid='id', tokenize='trigram'
+                     );
+                     INSERT INTO items_fts(rowid, text, preview, note) SELECT id, text, preview, note FROM items;
+                     CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
+                       INSERT INTO items_fts(rowid, text, preview, note) VALUES (new.id, new.text, new.preview, new.note);
+                     END;
+                     CREATE TRIGGER items_ad AFTER DELETE ON items BEGIN
+                       INSERT INTO items_fts(items_fts, rowid, text, preview, note) VALUES ('delete', old.id, old.text, old.preview, old.note);
+                     END;
+                     CREATE TRIGGER items_au AFTER UPDATE OF text, preview, note ON items BEGIN
+                       INSERT INTO items_fts(items_fts, rowid, text, preview, note) VALUES ('delete', old.id, old.text, old.preview, old.note);
+                       INSERT INTO items_fts(rowid, text, preview, note) VALUES (new.id, new.text, new.preview, new.note);
+                     END;",
                 )?;
             }
             connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -849,6 +1045,172 @@ mod tests {
     }
 
     #[test]
+    fn groups_crud_subtree_filter_and_note_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(directory.path()).unwrap();
+        let (parent_item, _) = store.add(text_item("hash-parent", "in parent")).unwrap();
+        let (child_item, _) = store.add(text_item("hash-child", "in child")).unwrap();
+        let (loose_item, _) = store.add(text_item("hash-loose", "no group")).unwrap();
+
+        let parent = store.group_create("工作", None).unwrap();
+        let child = store.group_create("代码", Some(parent)).unwrap();
+        store.item_set_group(parent_item, Some(parent)).unwrap();
+        store.item_set_group(child_item, Some(child)).unwrap();
+        store.set_item_note(loose_item, Some("营业执照 复印件")).unwrap();
+
+        // 直接计数与层级计数
+        let groups = store.groups().unwrap();
+        assert_eq!(groups.iter().find(|g| g.id == parent).unwrap().count, 1);
+        assert_eq!(groups.iter().find(|g| g.id == child).unwrap().count, 1);
+
+        // 选中父分组应包含子分组条目
+        let in_tree = store
+            .list(&ListQuery {
+                group_id: Some(parent),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(in_tree.total, 2);
+
+        // 未分组过滤
+        let ungrouped = store
+            .list(&ListQuery {
+                group_id: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(ungrouped.total, 1);
+        assert_eq!(ungrouped.items[0].id, loose_item);
+
+        // 备注纳入全文搜索（trigram：中文 >=3 字可命中）
+        let by_note = store
+            .list(&ListQuery {
+                q: Some("营业执照".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_note.total, 1);
+        assert_eq!(by_note.items[0].id, loose_item);
+
+        // 删除父分组：条目回到未分组，子分组级联消失
+        store.group_delete(parent).unwrap();
+        assert!(store.groups().unwrap().iter().all(|g| g.id != child));
+        let after = store
+            .list(&ListQuery {
+                group_id: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(after.total, 3);
+    }
+
+    #[test]
+    fn item_hotkeys_are_unique_and_survive_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(directory.path()).unwrap();
+        let (first, _) = store.add(text_item("hk-a", "a")).unwrap();
+        let (second, _) = store.add(text_item("hk-b", "b")).unwrap();
+
+        store.set_item_hotkey(first, Some("Ctrl+Alt+0")).unwrap();
+        // 同一热键分配给另一条目必须失败
+        assert!(store.set_item_hotkey(second, Some("Ctrl+Alt+0")).is_err());
+        store.set_item_hotkey(second, Some("Ctrl+Alt+9")).unwrap();
+        assert_eq!(store.item_hotkeys().unwrap().len(), 2);
+
+        // 清空与按天数清理都跳过绑了热键的条目
+        store.clear_all().unwrap();
+        assert_eq!(store.item_hotkeys().unwrap().len(), 2);
+        store
+            .prune(0, 1)
+            .unwrap();
+        assert_eq!(store.item_hotkeys().unwrap().len(), 2);
+        // 解绑后可以重新分配
+        store.set_item_hotkey(first, None).unwrap();
+        store
+            .set_item_hotkey(second, Some("Ctrl+Alt+0"))
+            .unwrap();
+    }
+
+    /// v6 时代的最小库：没有 note/hotkey/group_id、没有 groups 表、FTS 只索引两列。
+    const V6_LEGACY_SCHEMA: &str = r#"
+CREATE TABLE items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, text TEXT, html TEXT,
+  preview TEXT NOT NULL DEFAULT '', auto_kind TEXT NOT NULL DEFAULT 'plain',
+  hash TEXT NOT NULL UNIQUE, blob_name TEXT, thumb BLOB, width INTEGER, height INTEGER,
+  bytes INTEGER NOT NULL DEFAULT 0, source_app TEXT, pinned INTEGER NOT NULL DEFAULT 0,
+  use_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL
+);
+CREATE INDEX idx_items_order ON items(pinned DESC, last_used_at DESC);
+CREATE INDEX idx_items_kind ON items(kind);
+CREATE INDEX idx_items_auto_kind ON items(auto_kind);
+CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+CREATE TABLE item_tags (
+  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY (item_id, tag_id)
+);
+CREATE INDEX idx_item_tags_tag ON item_tags(tag_id);
+CREATE TABLE sync_tombstones (hash TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL);
+CREATE VIRTUAL TABLE items_fts USING fts5(text, preview, content='items', content_rowid='id', tokenize='trigram');
+CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
+  INSERT INTO items_fts(rowid, text, preview) VALUES (new.id, new.text, new.preview);
+END;
+CREATE TRIGGER items_ad AFTER DELETE ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, text, preview) VALUES ('delete', old.id, old.text, old.preview);
+END;
+CREATE TRIGGER items_au AFTER UPDATE OF text, preview ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, text, preview) VALUES ('delete', old.id, old.text, old.preview);
+  INSERT INTO items_fts(rowid, text, preview) VALUES (new.id, new.text, new.preview);
+END;
+INSERT INTO items(kind,text,preview,auto_kind,hash,bytes,created_at,last_used_at)
+  VALUES ('text','v6 存量内容','v6 存量内容','plain','v6-hash',0,1,1);
+"#;
+
+    #[test]
+    fn migration_v7_rebuilds_fts_and_keeps_legacy_content_searchable() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::load_or_create(directory.path()).unwrap();
+        {
+            let connection = Connection::open(directory.path().join("clipboard.db")).unwrap();
+            apply_key(&connection, &keys).unwrap();
+            connection.execute_batch(V6_LEGACY_SCHEMA).unwrap();
+            connection.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        let store = SqliteStore::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // 重建 FTS 后存量内容仍可搜索
+        let legacy = store
+            .list(&ListQuery {
+                q: Some("存量内容".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(legacy.total, 1);
+        // 新增的备注列也可搜索，说明触发器已换到三列版本
+        let id = legacy.items[0].id;
+        store.set_item_note(id, Some("迁移后新增的备注")).unwrap();
+        let by_note = store
+            .list(&ListQuery {
+                q: Some("新增的备注".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_note.total, 1);
+        // 新列与分组表就位
+        let group = store.group_create("迁移分组", None).unwrap();
+        store.item_set_group(id, Some(group)).unwrap();
+    }
+
+    #[test]
     fn persistent_store_round_trip() {
         let directory = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(directory.path()).unwrap();
@@ -890,8 +1252,16 @@ mod tests {
         let keys = KeyMaterial::load_or_create(directory.path()).unwrap();
         let connection = Connection::open(directory.path().join("clipboard.db")).unwrap();
         apply_key(&connection, &keys).unwrap();
+        // v4 库从 v6 遗留结构派生：再摘掉 html 列与 tombstones 表（v5/v6 迁移负责补）
         connection
-            .execute_batch(&SCHEMA.replace("text TEXT, html TEXT,", "text TEXT,"))
+            .execute_batch(
+                &V6_LEGACY_SCHEMA
+                    .replace("text TEXT, html TEXT,", "text TEXT,")
+                    .replace(
+                        "CREATE TABLE sync_tombstones (hash TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL);",
+                        "",
+                    ),
+            )
             .unwrap();
         connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
@@ -904,7 +1274,7 @@ mod tests {
                 .unwrap()
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            SCHEMA_VERSION
         );
         let backup_path = fs::read_dir(directory.path().join("migration-backups"))
             .unwrap()

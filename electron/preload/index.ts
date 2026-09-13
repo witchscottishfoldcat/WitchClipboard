@@ -12,6 +12,18 @@ const api: ClipboardApi = {
   clearAll: () => ipcRenderer.invoke('items:clear'),
   copy: (id) => ipcRenderer.invoke('items:copy', id),
   paste: (id) => ipcRenderer.invoke('items:paste', id),
+  // 旧 Electron 回滚版不实现新能力，调用即明确报错（与 WebDAV 桩同一策略）
+  pasteItems: async () => { throw new Error('旧 Electron 回滚版不支持多选粘贴') },
+  pasteTransformed: async () => { throw new Error('旧 Electron 回滚版不支持粘贴变换') },
+  setItemNote: async () => { throw new Error('旧 Electron 回滚版不支持备注') },
+  setItemHotkey: async () => { throw new Error('旧 Electron 回滚版不支持条目热键') },
+  groups: async () => [],
+  groupCreate: async () => { throw new Error('旧 Electron 回滚版不支持分组') },
+  groupRename: async () => { throw new Error('旧 Electron 回滚版不支持分组') },
+  groupDelete: async () => { throw new Error('旧 Electron 回滚版不支持分组') },
+  itemSetGroup: async () => { throw new Error('旧 Electron 回滚版不支持分组') },
+  exportItems: async () => { throw new Error('旧 Electron 回滚版不支持导出') },
+  importItems: async () => { throw new Error('旧 Electron 回滚版不支持导入') },
   imageDataUrl: (id) => ipcRenderer.invoke('items:image', id),
   relatedItems: (id, limit) => ipcRenderer.invoke('items:related', id, limit),
   hidePanel: () => ipcRenderer.invoke('panel:hide'),
@@ -57,6 +69,7 @@ const api: ClipboardApi = {
     ipcRenderer.on('panel:shown', handler)
     return () => ipcRenderer.off('panel:shown', handler)
   },
+  onPasteFailed: () => () => {},
 }
 
 contextBridge.exposeInMainWorld('witchcat', api)

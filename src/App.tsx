@@ -7,7 +7,10 @@ import type {
   ListQuery,
   PasteOutcome,
   UpdateStatus,
-} from '@shared/types'
+
+  PasteTransform,
+  Group,} from '@shared/types'
+import { ClipboardPaste } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useItems, useStats, useTags } from '@/hooks/useItems'
 import { useTheme } from '@/hooks/useTheme'
@@ -28,6 +31,7 @@ const PASTE_FAILURE_TEXT: Record<NonNullable<PasteOutcome['reason']>, string> = 
   'no-native': '已复制到剪贴板，请手动 Ctrl+V（原生能力不可用）',
   'no-target': '已复制，但没记录到目标窗口，请手动 Ctrl+V',
   'focus-failed': '已复制，但切不回原窗口，请手动 Ctrl+V',
+  'target-elevated': '目标窗口以管理员运行，无法自动粘贴；已复制，请手动 Ctrl+V',
   'send-failed': '已复制，模拟按键失败，请手动 Ctrl+V',
   'not-found': '这条记录已经不存在了',
 }
@@ -40,6 +44,10 @@ export default function App() {
   const [autoKind, setAutoKind] = useState<AutoKind | null>(null)
   const [tag, setTag] = useState<string | null>(null)
   const [pinnedOnly, setPinnedOnly] = useState(false)
+  const [groupId, setGroupId] = useState<number | null>(null)
+  const [groups, setGroups] = useState<Group[]>([])
+  const [multiSelected, setMultiSelected] = useState<Set<number>>(new Set())
+  const anchorIdRef = useRef<number | null>(null)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [crossDeviceOpen, setCrossDeviceOpen] = useState(false)
@@ -54,8 +62,8 @@ export default function App() {
   const toastSeq = useRef(0)
 
   const query = useMemo<ListQuery>(
-    () => ({ q, kind, autoKind, tag, pinnedOnly }),
-    [q, kind, autoKind, tag, pinnedOnly],
+    () => ({ q, kind, autoKind, tag, pinnedOnly, groupId }),
+    [q, kind, autoKind, tag, pinnedOnly, groupId],
   )
   const { items, total, loading } = useItems(query)
   const stats = useStats()
@@ -63,7 +71,7 @@ export default function App() {
 
   const selected = items.find((it) => it.id === selectedId) ?? null
   const index = items.findIndex((it) => it.id === selectedId)
-  const filtered = Boolean(q || kind || autoKind || tag || pinnedOnly)
+  const filtered = Boolean(q || kind || autoKind || tag || pinnedOnly || groupId !== null)
 
   const showToast = useCallback((text: string, tone: 'ok' | 'warn' = 'ok') => {
     if (toastTimer.current) clearTimeout(toastTimer.current)
@@ -82,6 +90,23 @@ export default function App() {
   }, [])
 
   useEffect(() => loadPreferences(), [loadPreferences])
+
+  const reloadGroups = useCallback(() => {
+    void api.groups().then(setGroups)
+  }, [])
+  useEffect(() => {
+    reloadGroups()
+    return api.onChanged(reloadGroups)
+  }, [reloadGroups])
+
+  // 后台热键粘贴失败时给可见提示（面板隐藏时事件无害）
+  useEffect(
+    () =>
+      api.onPasteFailed((reason) => {
+        showToast(PASTE_FAILURE_TEXT[reason as NonNullable<PasteOutcome['reason']>] ?? '后台粘贴失败', 'warn')
+      }),
+    [showToast],
+  )
 
   // 更新状态：主进程启动后会自动查一次，有结果就推过来
   useEffect(() => {
@@ -107,6 +132,9 @@ export default function App() {
         setAutoKind(null)
         setTag(null)
         setPinnedOnly(false)
+        setGroupId(null)
+        setMultiSelected(new Set())
+        anchorIdRef.current = null
         setSettingsOpen(false)
         setCrossDeviceOpen(false)
         inputRef.current?.focus()
@@ -139,6 +167,53 @@ export default function App() {
   const remove = useCallback((id: number) => void api.remove(id), [])
   const setItemTags = useCallback((id: number, t: string[]) => void api.setTags(id, t), [])
 
+  const pasteMulti = useCallback(() => {
+    // 按当前列表顺序粘贴，而不是点击顺序
+    const ids = items.filter((it) => multiSelected.has(it.id)).map((it) => it.id)
+    if (ids.length === 0) return
+    setMultiSelected(new Set())
+    void api.pasteItems(ids).then((r) => {
+      if (!r.ok) showToast(PASTE_FAILURE_TEXT[r.reason ?? 'send-failed'], 'warn')
+    })
+  }, [items, multiSelected, showToast])
+
+  const setItemNote = useCallback((id: number, note: string | null) => {
+    void api.setItemNote(id, note)
+  }, [])
+
+  const setItemGroup = useCallback(
+    (id: number, target: number | null) => {
+      void api.itemSetGroup(id, target).then(reloadGroups)
+    },
+    [reloadGroups],
+  )
+
+  const setItemHotkey = useCallback(
+    (id: number, hotkey: string | null) => {
+      void api.setItemHotkey(id, hotkey).catch((error: unknown) => {
+        const reason = typeof error === 'string' ? error : String(error)
+        const text = reason.includes('reserved')
+          ? '这个热键已留给面板功能，请换一个组合'
+          : reason.includes('conflict')
+            ? '热键冲突：已被其他条目或程序占用'
+            : reason.includes('invalid')
+              ? '无法识别这个组合键'
+              : '热键设置失败'
+        showToast(text, 'warn')
+      })
+    },
+    [showToast],
+  )
+
+  const pasteTransformed = useCallback(
+    (id: number, transform: PasteTransform) => {
+      void api.pasteTransformed(id, transform).then((r) => {
+        if (!r.ok) showToast(PASTE_FAILURE_TEXT[r.reason ?? 'send-failed'], 'warn')
+      })
+    },
+    [showToast],
+  )
+
   /** 手机在线时，用户在历史列表中选中哪条就立即发送哪条。 */
   const selectItem = useCallback((id: number) => {
     setSelectedId(id)
@@ -147,6 +222,40 @@ export default function App() {
       void api.sendCrossDeviceItem(id)
     })
   }, [])
+
+  /** Ctrl 点选加入/移出多选集合，Shift 从锚点连选，普通点击清空多选并单选。 */
+  const handleRowSelect = useCallback(
+    (id: number, e: { ctrlKey: boolean; shiftKey: boolean; metaKey: boolean; preventDefault: () => void }) => {
+      const toggle = e.ctrlKey || e.metaKey
+      if (toggle) {
+        e.preventDefault()
+        setMultiSelected((current) => {
+          const next = new Set(current)
+          if (next.has(id)) next.delete(id)
+          else next.add(id)
+          return next
+        })
+        anchorIdRef.current = id
+        setSelectedId(id)
+        return
+      }
+      if (e.shiftKey && anchorIdRef.current !== null) {
+        e.preventDefault()
+        const from = items.findIndex((it) => it.id === anchorIdRef.current)
+        const to = items.findIndex((it) => it.id === id)
+        if (from >= 0 && to >= 0) {
+          const [lo, hi] = from < to ? [from, to] : [to, from]
+          setMultiSelected(new Set(items.slice(lo, hi + 1).map((it) => it.id)))
+          setSelectedId(id)
+        }
+        return
+      }
+      setMultiSelected(new Set())
+      anchorIdRef.current = id
+      selectItem(id)
+    },
+    [items, selectItem],
+  )
 
   const move = useCallback(
     (delta: number) => {
@@ -199,7 +308,10 @@ export default function App() {
           }
           return
         case 'Enter':
-          if (selectedId !== null) {
+          if (multiSelected.size > 0) {
+            e.preventDefault()
+            pasteMulti()
+          } else if (selectedId !== null) {
             e.preventDefault()
             paste(selectedId)
           }
@@ -242,7 +354,9 @@ export default function App() {
     crossDeviceOpen,
     items,
     move,
+    multiSelected,
     paste,
+    pasteMulti,
     q,
     remove,
     selectedId,
@@ -289,13 +403,46 @@ export default function App() {
         pinnedOnly={pinnedOnly}
         onPinnedOnly={setPinnedOnly}
         visibleFilters={visibleFilters}
+        groups={groups}
+        activeGroupId={groupId}
+        onGroup={setGroupId}
+        onCreateGroup={(name, parentId) => {
+          void api.groupCreate(name, parentId).then(() => reloadGroups())
+        }}
+        onDeleteGroup={(id) => {
+          void api.groupDelete(id).then(() => {
+            if (groupId === id) setGroupId(null)
+            reloadGroups()
+          })
+        }}
       />
 
       <div className="flex min-h-0 flex-1 border-t border-black/6 dark:border-white/8">
+        {multiSelected.size > 0 && (
+          <div className="absolute inset-x-0 bottom-10 z-10 flex justify-center">
+            <div className="flex items-center gap-2 rounded-full bg-black/78 px-3 py-1.5 text-[12px] text-white shadow-lg backdrop-blur dark:bg-white/85 dark:text-black">
+              已选 {multiSelected.size} 条
+              <button
+                onClick={pasteMulti}
+                className="inline-flex h-6 items-center gap-1 rounded-full bg-brand-500 px-2.5 font-medium text-white transition hover:bg-brand-600"
+              >
+                <ClipboardPaste className="size-3" />
+                按顺序粘贴
+              </button>
+              <button
+                onClick={() => setMultiSelected(new Set())}
+                className="h-6 rounded-full px-2 text-white/70 transition hover:bg-white/12 dark:text-black/60 dark:hover:bg-black/8"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        )}
         <ItemList
           items={items}
           selectedId={selectedId}
-          onSelect={selectItem}
+          multiSelectedIds={multiSelected}
+          onSelect={handleRowSelect}
           onPaste={paste}
           onTogglePin={togglePin}
           loading={loading}
@@ -304,12 +451,17 @@ export default function App() {
         />
         <PreviewPane
           item={selected}
+          groups={groups}
           onPaste={paste}
           onCopy={copy}
           onTogglePin={togglePin}
           onRemove={remove}
           onSetTags={setItemTags}
           onReveal={(id) => void api.revealFile(id)}
+          onSetNote={setItemNote}
+          onSetGroup={setItemGroup}
+          onSetHotkey={setItemHotkey}
+          onPasteTransformed={pasteTransformed}
         />
       </div>
 

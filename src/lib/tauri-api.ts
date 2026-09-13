@@ -5,6 +5,7 @@ import { relaunch } from '@tauri-apps/plugin-process'
 import { check, type DownloadEvent, type Update } from '@tauri-apps/plugin-updater'
 import type {
   ClipboardApi,
+  Group,
   ListQuery,
   ListResult,
   PasteOutcome,
@@ -119,7 +120,24 @@ export function createTauriApi(): ClipboardApi {
     // Rust 侧命令已改 async；spawn_blocking join 失败（理论上只有 panic）时按粘贴失败兜底，
     // 避免未处理的 Promise rejection
     paste: (id): Promise<PasteOutcome> =>
-      invoke('paste_item', { id }).catch(() => ({ ok: false, reason: 'send-failed' }) as PasteOutcome),
+      invoke<PasteOutcome>('paste_item', { id }).catch(() => ({ ok: false, reason: 'send-failed' }) as PasteOutcome),
+    pasteItems: (ids): Promise<PasteOutcome> =>
+      invoke<PasteOutcome>('paste_items', { ids }).catch(
+        () => ({ ok: false, reason: 'send-failed' }) as PasteOutcome,
+      ),
+    pasteTransformed: (id, transform): Promise<PasteOutcome> =>
+      invoke<PasteOutcome>('paste_transformed', { id, transform }).catch(
+        () => ({ ok: false, reason: 'send-failed' }) as PasteOutcome,
+      ),
+    setItemNote: (id, note) => invoke('set_item_note', { id, note }),
+    setItemHotkey: (id, hotkey) => invoke('set_item_hotkey', { id, hotkey }),
+    groups: () => invoke<Group[]>('groups_list'),
+    groupCreate: (name, parentId) => invoke<number>('group_create', { name, parentId }),
+    groupRename: (id, name) => invoke('group_rename', { id, name }),
+    groupDelete: (id) => invoke('group_delete', { id }),
+    itemSetGroup: (id, groupId) => invoke('item_set_group', { id, groupId }),
+    exportItems: (ids) => invoke<string>('export_items', { ids }),
+    importItems: (path) => invoke<string>('import_items', { path }),
     imageDataUrl: (id) => invoke('clipboard_image', { id }),
     relatedItems: (id, limit) => invoke('clipboard_related', { id, limit }),
     hidePanel: () => invoke('hide_panel'),
@@ -166,5 +184,9 @@ export function createTauriApi(): ClipboardApi {
     },
     onChanged: (cb) => subscribe('witchcat://changed', cb),
     onPanelShown: (cb) => subscribe('witchcat://panel-shown', cb),
+    onPasteFailed: (cb) => {
+      const unsubscribe = listen<string>('witchcat://paste-failed', (event) => cb(event.payload))
+      return () => void unsubscribe.then((stop) => stop())
+    },
   }
 }

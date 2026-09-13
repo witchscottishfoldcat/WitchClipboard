@@ -1,5 +1,5 @@
-import { memo } from 'react'
-import { Pin, Image as ImageIcon } from 'lucide-react'
+import { memo, type MouseEvent } from 'react'
+import { Pin, Image as ImageIcon, CheckCircle2 } from 'lucide-react'
 import type { ClipItem } from '@shared/types'
 import { badgeOf, colorValue } from '@/lib/kinds'
 import { relativeTime } from '@/lib/format'
@@ -7,9 +7,12 @@ import { relativeTime } from '@/lib/format'
 interface Props {
   item: ClipItem
   selected: boolean
+  /** 处于多选集合中（Ctrl/Shift 选择） */
+  multiSelected: boolean
   /** 1..9，用于全局数字快粘；超出范围为 null */
   hotIndex: number | null
-  onSelect: () => void
+  /** 携带鼠标事件，供调用方判断 Ctrl/Shift 修饰键 */
+  onSelect: (e: MouseEvent) => void
   onPaste: () => void
   onTogglePin: () => void
 }
@@ -17,6 +20,7 @@ interface Props {
 export const ItemRow = memo(function ItemRow({
   item,
   selected,
+  multiSelected,
   hotIndex,
   onSelect,
   onPaste,
@@ -35,6 +39,7 @@ export const ItemRow = memo(function ItemRow({
         selected
           ? 'bg-brand-500/12 ring-1 ring-brand-500/35 dark:bg-brand-500/18'
           : 'hover:bg-black/4 dark:hover:bg-white/6',
+        multiSelected ? 'ring-1 ring-brand-500/55 bg-brand-500/8 dark:bg-brand-500/14' : '',
       ].join(' ')}
     >
       {/* 左侧类型色条 */}
@@ -123,6 +128,10 @@ export const ItemRow = memo(function ItemRow({
           <Pin className={`size-3.5 ${item.pinned ? 'fill-current' : ''}`} />
         </button>
       </div>
+
+      {multiSelected && (
+        <CheckCircle2 className="size-4 shrink-0 fill-brand-500 text-white" strokeWidth={2} />
+      )}
 
       {/* 全局数字快粘角标 */}
       {hotIndex !== null && (

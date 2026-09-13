@@ -11,12 +11,91 @@ import {
   FolderOpen,
   Link2,
   ChevronRight,
+  Keyboard,
 } from 'lucide-react'
-import type { ClipItem } from '@shared/types'
+import type { ClipItem, Group, PasteTransform } from '@shared/types'
 import { badgeOf, colorValue } from '@/lib/kinds'
 import { fileInfo } from '@/lib/files'
 import { absoluteTime, formatBytes } from '@/lib/format'
 import { api } from '@/lib/api'
+
+const TRANSFORMS: ReadonlyArray<readonly [PasteTransform, string, boolean]> = [
+  ['plainText', '纯文本', false],
+  ['upper', '大写', true],
+  ['lower', '小写', true],
+  ['capitalize', '首字母', true],
+  ['sentence', '句首', true],
+  ['camel', 'camel', true],
+  ['trim', '去空白', false],
+]
+
+/** 扁平分组列表转带缩进层级的下拉选项 */
+function groupOptions(groups: Group[]): Array<Group & { depth: number }> {
+  const depthOf = (group: Group, guard = 0): number => {
+    if (!group.parentId || guard > 8) return 0
+    const parent = groups.find((candidate) => candidate.id === group.parentId)
+    return parent ? depthOf(parent, guard + 1) + 1 : 0
+  }
+  return groups.map((group) => ({ ...group, depth: depthOf(group) }))
+}
+
+/** 条目级持久热键的录制与展示；Backspace 清除、Escape 取消 */
+function HotkeySetter({
+  current,
+  onCommit,
+}: {
+  current: string | null
+  onCommit: (value: string | null) => void
+}) {
+  const [recording, setRecording] = useState(false)
+
+  const capture = (e: KeyboardEvent<HTMLInputElement>): void => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (e.key === 'Escape') {
+      setRecording(false)
+      return
+    }
+    if (e.key === 'Backspace') {
+      if (current) onCommit(null)
+      setRecording(false)
+      return
+    }
+    if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return
+    const parts: string[] = []
+    if (e.ctrlKey) parts.push('Ctrl')
+    if (e.altKey) parts.push('Alt')
+    if (e.shiftKey) parts.push('Shift')
+    if (e.metaKey) parts.push('Super')
+    if (parts.length === 0) return // 全局热键必须带修饰键
+    parts.push(e.key.length === 1 ? e.key.toUpperCase() : e.key)
+    onCommit(parts.join('+'))
+    setRecording(false)
+  }
+
+  if (recording) {
+    return (
+      <input
+        autoFocus
+        readOnly
+        value="按下组合键…"
+        onKeyDown={capture}
+        onBlur={() => setRecording(false)}
+        className="h-6.5 w-24 shrink-0 rounded-md border border-brand-500/60 bg-brand-500/8 px-1.5 text-center text-[10.5px] text-brand-600 outline-none dark:text-brand-400"
+      />
+    )
+  }
+  return (
+    <button
+      onClick={() => setRecording(true)}
+      title={current ? '点击重设 · 录制中按 Backspace 清除' : '设置全局粘贴热键'}
+      className="inline-flex h-6.5 shrink-0 items-center gap-1 rounded-md border border-black/10 px-1.5 text-[10.5px] text-black/55 transition hover:border-brand-500/50 hover:text-brand-600 dark:border-white/12 dark:text-white/55 dark:hover:text-brand-400"
+    >
+      <Keyboard className="size-3" />
+      {current ?? '热键'}
+    </button>
+  )
+}
 
 /** 预览面板显示原图；列表里用的是缩略图 */
 function useFullImage(item: ClipItem | null): string | null {
@@ -75,22 +154,32 @@ function relatedPreview(item: ClipItem): string {
 
 interface Props {
   item: ClipItem | null
+  groups: Group[]
   onPaste: (id: number) => void
   onCopy: (id: number) => void
   onTogglePin: (id: number) => void
   onRemove: (id: number) => void
   onSetTags: (id: number, tags: string[]) => void
   onReveal: (id: number) => void
+  onSetNote: (id: number, note: string | null) => void
+  onSetGroup: (id: number, groupId: number | null) => void
+  onSetHotkey: (id: number, hotkey: string | null) => void
+  onPasteTransformed: (id: number, transform: PasteTransform) => void
 }
 
 export function PreviewPane({
   item,
+  groups,
   onPaste,
   onCopy,
   onTogglePin,
   onRemove,
   onSetTags,
   onReveal,
+  onSetNote,
+  onSetGroup,
+  onSetHotkey,
+  onPasteTransformed,
 }: Props) {
   const [draft, setDraft] = useState('')
   const [adding, setAdding] = useState(false)
@@ -309,6 +398,65 @@ export function PreviewPane({
               </button>
             )}
           </div>
+
+          {/* 备注：自由文本，纳入全文搜索 */}
+          <div className="px-3.5 pt-2.5">
+            <textarea
+              key={item.id}
+              defaultValue={item.note ?? ''}
+              placeholder="备注（可搜索）…"
+              rows={2}
+              onKeyDown={(e) => {
+                // 备注>里打字不应触发列表导航；Escape 保持原有「收起」语义
+                if (e.key !== 'Escape') e.stopPropagation()
+              }}
+              onBlur={(e) => {
+                const value = e.target.value.trim()
+                if (value !== (item.note ?? '')) onSetNote(item.id, value || null)
+              }}
+              className="w-full resize-none rounded-lg border border-black/8 bg-black/[0.025] px-2 py-1.5 text-[11.5px] leading-4 text-black/70 outline-none transition focus:border-brand-500/50 dark:border-white/10 dark:bg-white/[0.045] dark:text-white/72"
+            />
+          </div>
+
+          {/* 分组与条目热键 */}
+          <div className="flex items-center gap-1.5 px-3.5 pt-2.5">
+            <select
+              value={item.groupId ?? ''}
+              onChange={(e) =>
+                onSetGroup(item.id, e.target.value === '' ? null : Number(e.target.value))
+              }
+              className="h-6.5 min-w-0 flex-1 rounded-md border border-black/10 bg-black/[0.03] px-1.5 text-[11px] text-black/60 outline-none dark:border-white/12 dark:bg-white/8 dark:text-white/62"
+            >
+              <option value="">未分组</option>
+              {groupOptions(groups).map((group) => (
+                <option key={group.id} value={group.id}>
+                  {'　'.repeat(group.depth)}
+                  {group.name}
+                </option>
+              ))}
+            </select>
+            <HotkeySetter current={item.hotkey ?? null} onCommit={(value) => onSetHotkey(item.id, value)} />
+          </div>
+
+          {/* 粘贴变换：只对文本条目有意义；无字母文本禁用大小写类 */}
+          {item.kind === 'text' && (
+            <div className="flex flex-wrap gap-1 px-3.5 pt-2.5">
+              {TRANSFORMS.map(([transform, label, needsLetters]) => {
+                const disabled = needsLetters && !/[a-zA-Z]/.test(item.text ?? '')
+                return (
+                  <button
+                    key={transform}
+                    disabled={disabled}
+                    onClick={() => onPasteTransformed(item.id, transform)}
+                    title={`粘贴为${label}`}
+                    className="rounded-full border border-black/10 px-2 py-0.5 text-[10.5px] text-black/55 transition hover:border-brand-500/50 hover:text-brand-600 disabled:opacity-35 disabled:hover:border-black/10 disabled:hover:text-black/55 dark:border-white/12 dark:text-white/55 dark:hover:text-brand-400"
+                  >
+                    {label}
+                  </button>
+                )
+              })}
+            </div>
+          )}
 
           {/* 来源与时间 */}
           <div className="px-3.5 pt-2.5 text-[10.5px] leading-4 text-black/35 dark:text-white/35">

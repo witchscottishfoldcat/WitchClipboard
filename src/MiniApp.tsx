@@ -15,6 +15,7 @@ const PASTE_FAILURE_TEXT: Record<NonNullable<PasteOutcome['reason']>, string> = 
   'no-native': '已复制，请手动 Ctrl+V',
   'no-target': '已复制，请手动 Ctrl+V',
   'focus-failed': '已复制，但切不回原窗口',
+  'target-elevated': '目标窗口以管理员运行，请手动 Ctrl+V',
   'send-failed': '已复制，模拟按键失败',
   'not-found': '这条记录不存在了',
 }

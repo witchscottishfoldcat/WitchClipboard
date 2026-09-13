@@ -28,6 +28,7 @@ import type { FilterId, SecurityInfo, Settings } from '@shared/types'
 import { api } from '@/lib/api'
 import { isTauriRuntime, openExternal } from '@/lib/tauri-api'
 import { UpdateSection } from './UpdateSection'
+import { ImportExportSection } from './ImportExportSection'
 import { WebDavSection } from './WebDavSection'
 
 // WebDAV 同步功能尚未完成，先在设置页隐藏；做好后改回 true 即可恢复入口
@@ -552,6 +553,8 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
               <Trash2 className="size-3.5" />
               {confirmClear ? '确认清空？（置顶条目会保留）' : '清空历史记录'}
             </button>
+
+            <ImportExportSection onToast={onToast} onCleared={onCleared} />
           </section>
 
           {WEBDAV_ENABLED && <WebDavSection onToast={onToast} />}

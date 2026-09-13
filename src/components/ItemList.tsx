@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, type MouseEvent } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { ClipboardList } from 'lucide-react'
 import type { ClipItem } from '@shared/types'
@@ -7,7 +7,8 @@ import { ItemRow } from './ItemRow'
 interface Props {
   items: ClipItem[]
   selectedId: number | null
-  onSelect: (id: number) => void
+  multiSelectedIds: Set<number>
+  onSelect: (id: number, e: MouseEvent) => void
   onPaste: (id: number) => void
   onTogglePin: (id: number) => void
   loading: boolean
@@ -23,6 +24,7 @@ const LIST_TOP_GAP = 5
 export function ItemList({
   items,
   selectedId,
+  multiSelectedIds,
   onSelect,
   onPaste,
   onTogglePin,
@@ -103,8 +105,9 @@ export function ItemList({
               <ItemRow
                 item={item}
                 selected={item.id === selectedId}
+                multiSelected={multiSelectedIds.has(item.id)}
                 hotIndex={row.index < 9 ? row.index + 1 : null}
-                onSelect={() => onSelect(item.id)}
+                onSelect={(e) => onSelect(item.id, e)}
                 onPaste={() => onPaste(item.id)}
                 onTogglePin={() => onTogglePin(item.id)}
               />

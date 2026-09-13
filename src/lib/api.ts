@@ -107,8 +107,20 @@ export const fallbackApi: ClipboardApi = {
   skipUpdate: async () => ({ state: 'idle', currentVersion: '0.0.0' }),
   updateStatus: async () => ({ state: 'idle', currentVersion: '0.0.0' }),
   onUpdateStatus: () => () => {},
+  pasteItems: async () => ({ ok: false, reason: 'send-failed' as const }),
+  pasteTransformed: async () => ({ ok: false, reason: 'send-failed' as const }),
+  setItemNote: async () => {},
+  setItemHotkey: async () => { throw new Error('当前运行环境不支持设置热键') },
+  groups: async () => [],
+  groupCreate: async () => { throw new Error('当前运行环境不支持分组') },
+  groupRename: async () => { throw new Error('当前运行环境不支持分组') },
+  groupDelete: async () => { throw new Error('当前运行环境不支持分组') },
+  itemSetGroup: async () => {},
+  exportItems: async () => { throw new Error('当前运行环境不支持导出') },
+  importItems: async () => { throw new Error('当前运行环境不支持导入') },
   onChanged: () => () => {},
   onPanelShown: () => () => {},
+  onPasteFailed: () => () => {},
 }
 
 export const api: ClipboardApi = isTauriRuntime

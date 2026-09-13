@@ -1,0 +1,32 @@
+# winget 清单模板（F-22）
+# 用途：向 microsoft/winget-pkgs 提交 PR 的底稿，或供自建源使用。
+# 提交前必办：
+#   1. 用每个 Release 的实际 SHA256 替换 Installers.Hash（见 Release 附带的 SHA256SUMS.txt）
+#   2. 确认 PolyForm Noncommercial 1.0.0 在 winget-pkgs 社区仓库的准入政策；
+#      未确认前不要提交，避免清单被拒
+#   3. PackageVersion 与 Release 标签一致；InstallerUrl 指向对应版本的固定地址
+#   4. winget validate --manifest <目录> 通过后再提交 PR
+# 通道建议：发布 x64 与 arm64 两个安装器条目（本模板只示例 x64）。
+yamlFileVersion: 1.1.0
+PackageIdentifier: Witchcat.WitchClipboard
+PackageVersion: 1.9.0.0
+PackageName: Witch Clipboard
+Publisher: Thewitchcat
+License: PolyForm Noncommercial 1.0.0
+LicenseUrl: https://polyformproject.org/licenses/noncommercial/1.0.0/
+Moniker: witch-clipboard
+ShortDescription: 本地优先的剪贴板管理器：自动分类、来源搜索、关联配置、加密存储与端到端加密同步。
+PackageUrl: https://github.com/witchscottishfoldcat/Witch-Clipboard
+Tags:
+  - clipboard
+  - clipboard-manager
+  - utility
+Installers:
+  - Architecture: x64
+    InstallerType: nullsoft
+    InstallerUrl: https://github.com/witchscottishfoldcat/Witch-Clipboard/releases/download/v1.9.0/Witch.Clipboard_1.9.0_x64-setup.exe
+    InstallerSha256: REPLACE_WITH_RELEASE_SHA256
+    UpgradeBehavior: install
+MinimumOSVersion: 10.0.17763.0
+ManifestType: singleton
+ManifestVersion: 1.6.0
