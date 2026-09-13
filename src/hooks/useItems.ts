@@ -8,6 +8,26 @@ interface ItemsState {
   loading: boolean
 }
 
+/**
+ * 订阅库变更事件并防抖刷新：跨设备批量同步、连续复制会在短时间内触发一串
+ * witchcat://changed，逐个响应等于每个事件做全量重查，合并成一次即可。
+ */
+function useDebouncedChanged(reload: () => void): void {
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    const schedule = (): void => {
+      if (timer.current) clearTimeout(timer.current)
+      timer.current = setTimeout(reload, 80)
+    }
+    const stop = api.onChanged(schedule)
+    return () => {
+      stop()
+      if (timer.current) clearTimeout(timer.current)
+    }
+  }, [reload])
+}
+
 /** 拉取列表：query 变化时防抖重查，库变更时自动刷新 */
 export function useItems(query: ListQuery): ItemsState & { refetch: () => void } {
   const [state, setState] = useState<ItemsState>({ items: [], total: 0, loading: true })
@@ -26,7 +46,7 @@ export function useItems(query: ListQuery): ItemsState & { refetch: () => void }
     return () => clearTimeout(t)
   }, [fetch])
 
-  useEffect(() => api.onChanged(() => void fetch()), [fetch])
+  useDebouncedChanged(() => void fetch())
 
   return { ...state, refetch: () => void fetch() }
 }
@@ -38,8 +58,8 @@ export function useStats(): Stats | null {
 
   useEffect(() => {
     void load()
-    return api.onChanged(() => void load())
   }, [load])
+  useDebouncedChanged(() => void load())
 
   return stats
 }
@@ -51,8 +71,8 @@ export function useTags(): string[] {
 
   useEffect(() => {
     void load()
-    return api.onChanged(() => void load())
   }, [load])
+  useDebouncedChanged(() => void load())
 
   return tags
 }

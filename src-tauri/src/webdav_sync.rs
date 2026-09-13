@@ -196,7 +196,7 @@ impl WebDavSync {
         validate_config(&config)?;
         let client = Client::builder()
             .timeout(Duration::from_secs(45))
-            .user_agent("Witch-Clipboard/1.5 WebDAV-E2EE")
+            .user_agent(concat!("Witch-Clipboard/", env!("CARGO_PKG_VERSION"), " WebDAV-E2EE"))
             .build()
             .map_err(|error| error.to_string())?;
         ensure_collection(&client, &config, remote_root(&config))?;

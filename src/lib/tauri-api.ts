@@ -116,7 +116,10 @@ export function createTauriApi(): ClipboardApi {
     remove: (id) => invoke('remove_item', { id }),
     clearAll: () => invoke('clear_all'),
     copy: (id) => invoke('copy_item', { id }),
-    paste: (id): Promise<PasteOutcome> => invoke('paste_item', { id }),
+    // Rust 侧命令已改 async；spawn_blocking join 失败（理论上只有 panic）时按粘贴失败兜底，
+    // 避免未处理的 Promise rejection
+    paste: (id): Promise<PasteOutcome> =>
+      invoke('paste_item', { id }).catch(() => ({ ok: false, reason: 'send-failed' }) as PasteOutcome),
     imageDataUrl: (id) => invoke('clipboard_image', { id }),
     relatedItems: (id, limit) => invoke('clipboard_related', { id, limit }),
     hidePanel: () => invoke('hide_panel'),

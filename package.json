@@ -1,6 +1,6 @@
 {
   "name": "witch-clipboard",
-  "version": "1.7.4",
+  "version": "1.8.0",
   "private": true,
   "license": "PolyForm-Noncommercial-1.0.0",
   "description": "Witch Clipboard — 本地优先的剪贴板管理器：自动分类、来源搜索、关联配置、加密存储与局域网跨设备同步。",
@@ -46,18 +46,17 @@
   },
   "//": "只有主进程运行时真正 require 的模块才放 dependencies——electron-builder 会把它们打进 asar。渲染层依赖已被 Vite 打包，放 devDependencies 免得重复塞一份进安装包。",
   "dependencies": {
-    "@tauri-apps/api": "^2.10.1",
-    "@tauri-apps/plugin-process": "^2.3.1",
-    "@tauri-apps/plugin-updater": "^2.10.0",
     "better-sqlite3-multiple-ciphers": "^12.11.1",
     "electron-updater": "^6.8.9",
-    "koffi": "^3.1.2",
-    "qrcode": "^1.5.4"
+    "koffi": "^3.1.2"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.2.0",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2.10.1",
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.0",
     "@tanstack/react-virtual": "^3.14.8",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.0.0",
@@ -70,6 +69,7 @@
     "electron-vite": "^5.0.0",
     "lucide-react": "^1.27.0",
     "motion": "^12.42.2",
+    "qrcode": "^1.5.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tailwindcss": "^4.3.3",

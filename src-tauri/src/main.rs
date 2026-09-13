@@ -42,6 +42,9 @@ use storage::{NewItem, SqliteStore};
 const HIDDEN_RESTART_MARKER: &str = ".restart-hidden";
 const MAIN_TOGGLE_DEBOUNCE_MS: i64 = 300;
 const MINI_HOTKEY: &str = "Alt+M";
+// prune 涉及全表排序删除与墓碑写入，不必随每次复制执行；最多每分钟一次，
+// 超出的容量在下次 prune 前会短暂超限，可接受。
+const PRUNE_INTERVAL_MS: i64 = 60_000;
 
 struct AppState {
     store: SqliteStore,
@@ -54,6 +57,7 @@ struct AppState {
     last_main_toggle_at: AtomicI64,
     quick_shortcuts: Mutex<HashMap<u32, usize>>,
     hidden_at: AtomicI64,
+    last_prune_at: AtomicI64,
     window_hidden_at: Mutex<HashMap<String, i64>>,
     cross_device: cross_device::CrossDevice,
     webdav: webdav_sync::WebDavSync,
@@ -77,6 +81,7 @@ impl AppState {
             last_main_toggle_at: AtomicI64::new(0),
             quick_shortcuts: Mutex::new(HashMap::new()),
             hidden_at: AtomicI64::new(0),
+            last_prune_at: AtomicI64::new(0),
             window_hidden_at: Mutex::new(HashMap::new()),
             cross_device: cross_device::CrossDevice::new(phone_sender, &data_dir),
             webdav,
@@ -89,6 +94,16 @@ fn text_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn prune_if_due(state: &AppState) {
+    let now = epoch_ms();
+    let previous = state.last_prune_at.swap(now, Ordering::AcqRel);
+    if now - previous < PRUNE_INTERVAL_MS {
+        return;
+    }
+    let settings = state.settings.get();
+    let _ = state.store.prune(settings.max_items, settings.max_days);
 }
 
 fn insert_text(
@@ -119,8 +134,7 @@ fn insert_text(
         })
         .is_ok();
     if added {
-        let settings = state.settings.get();
-        let _ = state.store.prune(settings.max_items, settings.max_days);
+        prune_if_due(state);
     }
     added
 }
@@ -166,17 +180,34 @@ fn insert_files(state: &AppState, paths: Vec<String>, source_app: Option<String>
         })
         .is_ok();
     if added {
-        let settings = state.settings.get();
-        let _ = state.store.prune(settings.max_items, settings.max_days);
+        prune_if_due(state);
     }
     added
 }
 
-fn capture_current_clipboard(state: &AppState) -> bool {
+/// 从剪贴板读出的原始内容。读操作必须持有 clipboard_gate（与自己写入侧的时序配合），
+/// 但 PNG 编码、哈希、入库这些重活可以在锁外做。
+enum ClipCapture {
+    Text {
+        text: String,
+        html: Option<String>,
+        source_app: Option<String>,
+    },
+    Files {
+        paths: Vec<String>,
+        source_app: Option<String>,
+    },
+    Image {
+        rgba: image::RgbaImage,
+        source_app: Option<String>,
+    },
+}
+
+fn read_clipboard_update(state: &AppState) -> Option<ClipCapture> {
     let source_app = platform::foreground_exe();
     let settings = state.settings.get();
     if settings.skip_sensitive && platform::has_sensitive_marker() {
-        return false;
+        return None;
     }
     if settings.skip_sensitive
         && source_app.as_ref().is_some_and(|exe| {
@@ -185,29 +216,44 @@ fn capture_current_clipboard(state: &AppState) -> bool {
             })
         })
     {
-        return false;
+        return None;
     }
     if let Some(paths) = platform::read_clipboard_files() {
-        return insert_files(state, paths, source_app);
+        return Some(ClipCapture::Files { paths, source_app });
     }
 
-    let Ok(mut clipboard) = Clipboard::new() else {
-        return false;
-    };
+    let mut clipboard = Clipboard::new().ok()?;
     let html = clipboard.get().html().ok();
     if let Ok(text) = clipboard.get_text() {
-        return insert_text(state, text, html, source_app);
+        return Some(ClipCapture::Text {
+            text,
+            html,
+            source_app,
+        });
     }
-    let Ok(image) = clipboard.get_image() else {
-        return false;
-    };
-    let Some(rgba) = image::RgbaImage::from_raw(
+    let image = clipboard.get_image().ok()?;
+    let rgba = image::RgbaImage::from_raw(
         image.width as u32,
         image.height as u32,
         image.bytes.into_owned(),
-    ) else {
-        return false;
-    };
+    )?;
+    Some(ClipCapture::Image { rgba, source_app })
+}
+
+fn ingest_clipboard(state: &AppState, capture: ClipCapture) -> bool {
+    match capture {
+        ClipCapture::Text {
+            text,
+            html,
+            source_app,
+        } => insert_text(state, text, html, source_app),
+        ClipCapture::Files { paths, source_app } => insert_files(state, paths, source_app),
+        ClipCapture::Image { rgba, source_app } => insert_image(state, rgba, source_app),
+    }
+}
+
+fn insert_image(state: &AppState, rgba: image::RgbaImage, source_app: Option<String>) -> bool {
+    let (width, height) = rgba.dimensions();
     let mut png = Vec::new();
     if image::DynamicImage::ImageRgba8(rgba.clone())
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
@@ -229,17 +275,26 @@ fn capture_current_clipboard(state: &AppState) -> bool {
             kind: "image".into(),
             text: None,
             html: None,
-            preview: format!("图片 {}×{}", image.width, image.height),
+            preview: format!("图片 {width}×{height}"),
             auto_kind: "plain".into(),
             hash,
             blob_name: Some(blob_name),
             thumb: Some(thumb),
-            width: Some(image.width as u32),
-            height: Some(image.height as u32),
+            width: Some(width),
+            height: Some(height),
             bytes: png.len(),
             source_app,
         })
         .is_ok()
+}
+
+/// 测试与 E2E 脚本用的便利封装；生产路径走 start_text_monitor 里的 read/ingest 两段式。
+#[cfg(test)]
+fn capture_current_clipboard(state: &AppState) -> bool {
+    let Some(capture) = read_clipboard_update(state) else {
+        return false;
+    };
+    ingest_clipboard(state, capture)
 }
 
 fn text_hash_bytes(bytes: &[u8]) -> String {
@@ -261,19 +316,29 @@ fn start_text_monitor(app: AppHandle, state: Arc<AppState>) {
         while notifications.recv().is_ok() {
             // Own writes hold this gate until their sequence number is published. This removes
             // the race where WM_CLIPBOARDUPDATE can arrive before the writer marks it ignored.
-            let _clipboard_guard = state
-                .clipboard_gate
-                .lock()
-                .expect("clipboard gate lock poisoned");
-            let sequence = platform::clipboard_sequence();
-            if sequence == last_sequence {
+            // 临界区只覆盖序列号比对与剪贴板读取；PNG 编码、哈希、入库都移出锁外，
+            // 否则复制大截图时快粘键路径会被编码耗时阻塞。
+            let capture = {
+                let _clipboard_guard = state
+                    .clipboard_gate
+                    .lock()
+                    .expect("clipboard gate lock poisoned");
+                let sequence = platform::clipboard_sequence();
+                if sequence == last_sequence {
+                    None
+                } else {
+                    last_sequence = sequence;
+                    if sequence == state.own_clipboard_sequence.load(Ordering::Acquire) {
+                        None
+                    } else {
+                        read_clipboard_update(&state)
+                    }
+                }
+            };
+            let Some(capture) = capture else {
                 continue;
-            }
-            last_sequence = sequence;
-            if sequence == state.own_clipboard_sequence.load(Ordering::Acquire) {
-                continue;
-            }
-            if capture_current_clipboard(&state) {
+            };
+            if ingest_clipboard(&state, capture) {
                 let _ = app.emit("witchcat://changed", ());
             }
         }
@@ -731,8 +796,14 @@ fn handle_shortcut(app: &AppHandle, shortcut: &Shortcut) {
 }
 
 #[tauri::command]
-fn clipboard_list(state: State<'_, Arc<AppState>>, query: ListQuery) -> Result<ListResult, String> {
-    state.store.list(&query).map_err(|e| e.to_string())
+async fn clipboard_list(
+    state: State<'_, Arc<AppState>>,
+    query: ListQuery,
+) -> Result<ListResult, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.store.list(&query).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -751,24 +822,37 @@ fn clipboard_set_tags(state: State<'_, Arc<AppState>>, id: i64, tags: Vec<String
 }
 
 #[tauri::command]
-fn clipboard_image(state: State<'_, Arc<AppState>>, id: i64) -> Result<Option<String>, String> {
-    state
-        .store
-        .image_png(id)
-        .map(|png| png.map(|data| format!("data:image/png;base64,{}", BASE64.encode(data))))
-        .map_err(|e| e.to_string())
+async fn clipboard_image(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<Option<String>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .store
+            .image_png(id)
+            .map(|png| png.map(|data| format!("data:image/png;base64,{}", BASE64.encode(data))))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn clipboard_related(
+async fn clipboard_related(
     state: State<'_, Arc<AppState>>,
     id: i64,
     limit: Option<usize>,
 ) -> Result<Vec<model::ClipItem>, String> {
-    state
-        .store
-        .related(id, limit.unwrap_or(5))
-        .map_err(|e| e.to_string())
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .store
+            .related(id, limit.unwrap_or(5))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -895,40 +979,45 @@ fn cross_device_status(state: State<'_, Arc<AppState>>) -> cross_device::Status 
     state.cross_device.status()
 }
 #[tauri::command]
-fn cross_device_send(
+async fn cross_device_send(
     state: State<'_, Arc<AppState>>,
     id: i64,
 ) -> Result<cross_device::SendResult, String> {
-    let item = state
-        .store
-        .get(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "not-found".to_string())?;
-    Ok(match item.kind.as_str() {
-        "text" => state
-            .cross_device
-            .publish_text(item.text.unwrap_or_default()),
-        "image" => state.cross_device.publish_image(
-            state
-                .store
-                .image_png(id)
-                .map_err(|e| e.to_string())?
-                .unwrap_or_default(),
-            item.preview,
-        ),
-        "files" => state.cross_device.publish_files(
-            item.text
-                .unwrap_or_default()
-                .lines()
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        _ => cross_device::SendResult {
-            ok: false,
-            reason: Some("unsupported"),
-        },
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let item = state
+            .store
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not-found".to_string())?;
+        Ok(match item.kind.as_str() {
+            "text" => state
+                .cross_device
+                .publish_text(item.text.unwrap_or_default()),
+            "image" => state.cross_device.publish_image(
+                state
+                    .store
+                    .image_png(id)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default(),
+                item.preview,
+            ),
+            "files" => state.cross_device.publish_files(
+                item.text
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            _ => cross_device::SendResult {
+                ok: false,
+                reason: Some("unsupported"),
+            },
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1090,40 +1179,52 @@ fn write_item(state: &AppState, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn copy_item(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    write_item(&state, id)
+async fn copy_item(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || write_item(&state, id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn paste_item(window: WebviewWindow, state: State<'_, Arc<AppState>>, id: i64) -> PasteOutcome {
-    if write_item(&state, id).is_err() {
-        return PasteOutcome {
-            ok: false,
-            reason: Some("not-found"),
-        };
-    }
-
-    let hidden = state.settings.get().hide_after_paste;
-    if hidden {
-        hide_window(&window);
-    }
-    let target = state.target_hwnd.load(Ordering::Acquire);
-    match platform::restore_and_paste(target) {
-        Ok(()) => PasteOutcome {
-            ok: true,
-            reason: None,
-        },
-        Err(reason) => {
-            if hidden {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-            PasteOutcome {
+async fn paste_item(
+    window: WebviewWindow,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<PasteOutcome, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if write_item(&state, id).is_err() {
+            return PasteOutcome {
                 ok: false,
-                reason: Some(reason),
+                reason: Some("not-found"),
+            };
+        }
+
+        let hidden = state.settings.get().hide_after_paste;
+        if hidden {
+            hide_window(&window);
+        }
+        let target = state.target_hwnd.load(Ordering::Acquire);
+        match platform::restore_and_paste(target) {
+            Ok(()) => PasteOutcome {
+                ok: true,
+                reason: None,
+            },
+            Err(reason) => {
+                if hidden {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                PasteOutcome {
+                    ok: false,
+                    reason: Some(reason),
+                }
             }
         }
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 fn main() {
@@ -1330,6 +1431,7 @@ mod tests {
             last_main_toggle_at: AtomicI64::new(0),
             quick_shortcuts: Mutex::new(HashMap::new()),
             hidden_at: AtomicI64::new(0),
+            last_prune_at: AtomicI64::new(0),
             window_hidden_at: Mutex::new(HashMap::new()),
             cross_device: {
                 let (tx, _) = mpsc::channel();
