@@ -203,11 +203,24 @@ enum ClipCapture {
     },
 }
 
-fn read_clipboard_update(state: &AppState) -> Option<ClipCapture> {
-    let source_app = platform::foreground_exe();
+/// Outcome of one attempt to read the system clipboard.
+enum ReadAttempt<T> {
+    /// Content captured and ready to ingest.
+    Captured(T),
+    /// Deliberately not recorded: sensitive marker, blacklisted source, or no supported
+    /// format present.
+    Skip,
+    /// The clipboard was busy or the data could not be fetched yet; worth retrying.
+    Transient,
+}
+
+fn read_clipboard_update(state: &AppState) -> ReadAttempt<ClipCapture> {
+    // Attribution follows the writer of the data, not whoever happens to be foreground:
+    // background writes and fast window switches would otherwise blame the wrong app.
+    let source_app = platform::clipboard_owner_exe().or_else(platform::foreground_exe);
     let settings = state.settings.get();
-    if settings.skip_sensitive && platform::has_sensitive_marker() {
-        return None;
+    if settings.skip_sensitive && platform::clipboard_marked_sensitive() {
+        return ReadAttempt::Skip;
     }
     if settings.skip_sensitive
         && source_app.as_ref().is_some_and(|exe| {
@@ -216,28 +229,47 @@ fn read_clipboard_update(state: &AppState) -> Option<ClipCapture> {
             })
         })
     {
-        return None;
+        return ReadAttempt::Skip;
     }
-    if let Some(paths) = platform::read_clipboard_files() {
-        return Some(ClipCapture::Files { paths, source_app });
+    // Explorer accompanies copied files with their paths as text; checking the file format
+    // first keeps a copied video from being recorded as a plain string.
+    if platform::clipboard_has_files() {
+        return match platform::read_clipboard_files() {
+            Some(paths) => ReadAttempt::Captured(ClipCapture::Files { paths, source_app }),
+            None => ReadAttempt::Transient,
+        };
     }
 
-    let mut clipboard = Clipboard::new().ok()?;
-    let html = clipboard.get().html().ok();
-    if let Ok(text) = clipboard.get_text() {
-        return Some(ClipCapture::Text {
+    let Ok(mut clipboard) = Clipboard::new() else {
+        return ReadAttempt::Transient;
+    };
+    if platform::clipboard_has_text() {
+        // The format is present, so a failed fetch means the provider is mid-write or the
+        // clipboard reopened — transient conditions, never "no data".
+        let Ok(text) = clipboard.get_text() else {
+            return ReadAttempt::Transient;
+        };
+        let html = clipboard.get().html().ok();
+        return ReadAttempt::Captured(ClipCapture::Text {
             text,
             html,
             source_app,
         });
     }
-    let image = clipboard.get_image().ok()?;
-    let rgba = image::RgbaImage::from_raw(
-        image.width as u32,
-        image.height as u32,
-        image.bytes.into_owned(),
-    )?;
-    Some(ClipCapture::Image { rgba, source_app })
+    if platform::clipboard_has_image() {
+        let Ok(image) = clipboard.get_image() else {
+            return ReadAttempt::Transient;
+        };
+        let Some(rgba) = image::RgbaImage::from_raw(
+            image.width as u32,
+            image.height as u32,
+            image.bytes.into_owned(),
+        ) else {
+            return ReadAttempt::Skip;
+        };
+        return ReadAttempt::Captured(ClipCapture::Image { rgba, source_app });
+    }
+    ReadAttempt::Skip
 }
 
 fn ingest_clipboard(state: &AppState, capture: ClipCapture) -> bool {
@@ -291,16 +323,59 @@ fn insert_image(state: &AppState, rgba: image::RgbaImage, source_app: Option<Str
 /// 测试与 E2E 脚本用的便利封装；生产路径走 start_text_monitor 里的 read/ingest 两段式。
 #[cfg(test)]
 fn capture_current_clipboard(state: &AppState) -> bool {
-    let Some(capture) = read_clipboard_update(state) else {
-        return false;
-    };
-    ingest_clipboard(state, capture)
+    match read_clipboard_update(state) {
+        ReadAttempt::Captured(capture) => ingest_clipboard(state, capture),
+        _ => false,
+    }
 }
 
 fn text_hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+// The clipboard is contended by every listener on the system; failed opens and fetches are
+// normal, so a dropped read is retried briefly before the change is given up on.
+const CLIPBOARD_READ_RETRIES: u32 = 2;
+const CLIPBOARD_READ_RETRY_DELAY: Duration = Duration::from_millis(10);
+// Writers publish content and exclusion markers through consecutive SetClipboardData calls,
+// each posting its own update event. Reading on the first event can record content before
+// its opt-out marker exists, so the event stream is allowed to go quiet before reading once.
+const CLIPBOARD_EVENT_SETTLE: Duration = Duration::from_millis(100);
+
+fn read_with_retries<T>(
+    max_retries: u32,
+    retry_delay: Duration,
+    mut attempt_read: impl FnMut() -> ReadAttempt<T>,
+) -> Option<T> {
+    let mut attempts = 0u32;
+    loop {
+        match attempt_read() {
+            ReadAttempt::Captured(value) => return Some(value),
+            ReadAttempt::Skip => return None,
+            ReadAttempt::Transient => {
+                if attempts >= max_retries {
+                    eprintln!(
+                        "clipboard read still failing after {attempts} retries; dropping this change"
+                    );
+                    return None;
+                }
+                attempts += 1;
+                // Sleep happens here, outside the attempt closure, so no clipboard gate is
+                // ever held while waiting.
+                thread::sleep(retry_delay);
+            }
+        }
+    }
+}
+
+fn wait_for_clipboard_settle(receiver: &mpsc::Receiver<()>) -> bool {
+    if receiver.recv().is_err() {
+        return false; // event channel closed, the monitor should stop
+    }
+    while receiver.recv_timeout(CLIPBOARD_EVENT_SETTLE).is_ok() {}
+    true
 }
 
 fn start_text_monitor(app: AppHandle, state: Arc<AppState>) {
@@ -313,28 +388,40 @@ fn start_text_monitor(app: AppHandle, state: Arc<AppState>) {
     };
     thread::spawn(move || {
         let mut last_sequence = platform::clipboard_sequence();
-        while notifications.recv().is_ok() {
+        while wait_for_clipboard_settle(&notifications) {
             // Own writes hold this gate until their sequence number is published. This removes
             // the race where WM_CLIPBOARDUPDATE can arrive before the writer marks it ignored.
             // 临界区只覆盖序列号比对与剪贴板读取；PNG 编码、哈希、入库都移出锁外，
             // 否则复制大截图时快粘键路径会被编码耗时阻塞。
-            let capture = {
-                let _clipboard_guard = state
-                    .clipboard_gate
-                    .lock()
-                    .expect("clipboard gate lock poisoned");
-                let sequence = platform::clipboard_sequence();
-                if sequence == last_sequence {
-                    None
-                } else {
-                    last_sequence = sequence;
-                    if sequence == state.own_clipboard_sequence.load(Ordering::Acquire) {
-                        None
-                    } else {
-                        read_clipboard_update(&state)
+            let capture = read_with_retries(
+                CLIPBOARD_READ_RETRIES,
+                CLIPBOARD_READ_RETRY_DELAY,
+                || {
+                    let _clipboard_guard = state
+                        .clipboard_gate
+                        .lock()
+                        .expect("clipboard gate lock poisoned");
+                    let sequence = platform::clipboard_sequence();
+                    if sequence == last_sequence
+                        || sequence == state.own_clipboard_sequence.load(Ordering::Acquire)
+                    {
+                        return ReadAttempt::Skip;
                     }
-                }
-            };
+                    // The sequence number is consumed only once the outcome is decided;
+                    // leaving it untouched on Transient is what lets the retry re-read.
+                    match read_clipboard_update(&state) {
+                        ReadAttempt::Captured(capture) => {
+                            last_sequence = sequence;
+                            ReadAttempt::Captured(capture)
+                        }
+                        ReadAttempt::Skip => {
+                            last_sequence = sequence;
+                            ReadAttempt::Skip
+                        }
+                        ReadAttempt::Transient => ReadAttempt::Transient,
+                    }
+                },
+            );
             let Some(capture) = capture else {
                 continue;
             };
@@ -1477,6 +1564,69 @@ mod tests {
         assert_eq!(items[0].auto_kind, "path");
         assert_eq!(items[0].source_app.as_deref(), Some("explorer.exe"));
         assert!(items[0].preview.contains("2 个文件"));
+    }
+
+    #[test]
+    fn read_with_retries_recovers_after_transient_failures() {
+        let mut calls = 0u32;
+        let value = read_with_retries(2, Duration::ZERO, || {
+            calls += 1;
+            match calls {
+                1 | 2 => ReadAttempt::Transient,
+                _ => ReadAttempt::Captured("captured".to_string()),
+            }
+        });
+        assert_eq!(value.as_deref(), Some("captured"));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn read_with_retries_drops_after_exhausting_retries() {
+        let mut calls = 0u32;
+        let value: Option<String> =
+            read_with_retries(2, Duration::ZERO, || {
+                calls += 1;
+                ReadAttempt::Transient
+            });
+        assert_eq!(value, None);
+        assert_eq!(calls, 3); // initial attempt plus two retries
+    }
+
+    #[test]
+    fn read_with_retries_returns_immediately_on_skip() {
+        let mut calls = 0u32;
+        let value: Option<String> = read_with_retries(2, Duration::ZERO, || {
+            calls += 1;
+            ReadAttempt::Skip
+        });
+        assert_eq!(value, None);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn clipboard_events_settle_only_after_a_quiet_window() {
+        let (sender, receiver) = mpsc::channel();
+        // The drain loop treats a disconnected channel as "settled", so the producer must
+        // stay alive through the whole window — in production the listener thread holds it.
+        let keepalive = sender.clone();
+        let sender_thread = thread::spawn(move || {
+            sender.send(()).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            sender.send(()).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            sender.send(()).unwrap();
+        });
+        let started = std::time::Instant::now();
+        assert!(wait_for_clipboard_settle(&receiver));
+        // The last event landed well inside the settle window, so the full window must
+        // have elapsed before reading was allowed.
+        assert!(started.elapsed() >= CLIPBOARD_EVENT_SETTLE);
+        sender_thread.join().unwrap();
+        drop(keepalive);
+
+        let (closed_sender, receiver) = mpsc::channel();
+        drop(closed_sender);
+        assert!(!wait_for_clipboard_settle(&receiver));
     }
 
     /// This test intentionally mutates the real Windows clipboard. Keep it ignored and run it

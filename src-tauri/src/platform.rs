@@ -15,8 +15,9 @@ mod imp {
         System::{
             DataExchange::{
                 AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-                GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
-                RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
+                GetClipboardOwner, GetClipboardSequenceNumber, IsClipboardFormatAvailable,
+                OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener,
+                SetClipboardData,
             },
             LibraryLoader::GetModuleHandleW,
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
@@ -46,14 +47,25 @@ mod imp {
         },
     };
 
+    const CF_UNICODETEXT: u32 = 13;
+    const CF_DIB: u32 = 8;
+    const CF_DIBV5: u32 = 17;
     const CF_HDROP: u32 = 15;
     const VK_V: u8 = 0x56;
     const DROPFILES_HEADER_BYTES: usize = 20;
-    const SENSITIVE_FORMATS: &[&str] = &[
+    // The clipboard is a system-wide singleton: other processes (or sibling listeners in this
+    // one) routinely hold it for a few milliseconds. One OpenClipboard call fails often enough
+    // under contention that every native read/write path needs a short retry.
+    const OPEN_CLIPBOARD_ATTEMPTS: usize = 5;
+    const OPEN_CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(5);
+    // Presence of either format is an unconditional request to stay out of history.
+    const SENSITIVE_PRESENCE_FORMATS: &[&str] = &[
         "ExcludeClipboardContentFromMonitorProcessing",
-        "CanIncludeInClipboardHistory",
         "Clipboard Viewer Ignore",
     ];
+    // Value-based flag: a DWORD of 0 opts out of history, any non-zero value is an explicit
+    // opt-in. Presence alone cannot decide — the payload must be read.
+    const HISTORY_FLAG_FORMAT: &str = "CanIncludeInClipboardHistory";
     static CLIPBOARD_EVENTS: OnceLock<mpsc::Sender<()>> = OnceLock::new();
     // Store the extracted HICON handles for the process lifetime. Windows does not copy handles
     // passed through WM_SETICON, so destroying them while a window is alive would leave it with
@@ -337,9 +349,7 @@ mod imp {
         (pid != 0).then_some(pid)
     }
 
-    pub fn foreground_exe() -> Option<String> {
-        let hwnd = foreground_window()?;
-        let pid = window_process_id(hwnd)?;
+    fn exe_name_from_pid(pid: u32) -> Option<String> {
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if process.is_null() {
             return None;
@@ -361,12 +371,88 @@ mod imp {
             .map(|name| name.to_string_lossy().into_owned())
     }
 
-    pub fn has_sensitive_marker() -> bool {
-        SENSITIVE_FORMATS.iter().any(|name| {
-            let wide_name = wide(name);
-            let format = unsafe { RegisterClipboardFormatW(wide_name.as_ptr()) };
-            format != 0 && unsafe { IsClipboardFormatAvailable(format) } != 0
-        })
+    pub fn foreground_exe() -> Option<String> {
+        let hwnd = foreground_window()?;
+        let pid = window_process_id(hwnd)?;
+        exe_name_from_pid(pid)
+    }
+
+    /// Process that last wrote the clipboard. Attribution must follow the writer, not the
+    /// foreground window: copies from background processes and fast window switches would
+    /// otherwise be attributed to the wrong source.
+    pub fn clipboard_owner_exe() -> Option<String> {
+        let owner = unsafe { GetClipboardOwner() };
+        if owner.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(owner, &mut pid) };
+        if pid == 0 {
+            return None;
+        }
+        usable_owner_name(exe_name_from_pid(pid))
+    }
+
+    fn usable_owner_name(name: Option<String>) -> Option<String> {
+        // UWP apps surface RuntimeBroker.exe as the clipboard owner, which says nothing
+        // about the real source; reject it so callers fall back to the foreground window.
+        match name {
+            Some(name) if !name.eq_ignore_ascii_case("RuntimeBroker.exe") => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn clipboard_has_files() -> bool {
+        unsafe { IsClipboardFormatAvailable(CF_HDROP) != 0 }
+    }
+
+    pub fn clipboard_has_text() -> bool {
+        unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 }
+    }
+
+    pub fn clipboard_has_image() -> bool {
+        unsafe { IsClipboardFormatAvailable(CF_DIBV5) != 0 || IsClipboardFormatAvailable(CF_DIB) != 0 }
+    }
+
+    pub fn clipboard_marked_sensitive() -> bool {
+        let presence = SENSITIVE_PRESENCE_FORMATS
+            .iter()
+            .map(|name| format_available_by_name(name))
+            .collect::<Vec<_>>();
+        let history_flag = registered_format_dword(HISTORY_FLAG_FORMAT);
+        sensitive_marker_decision(&presence, history_flag)
+    }
+
+    fn format_available_by_name(name: &str) -> bool {
+        let wide_name = wide(name);
+        let format = unsafe { RegisterClipboardFormatW(wide_name.as_ptr()) };
+        format != 0 && unsafe { IsClipboardFormatAvailable(format) } != 0
+    }
+
+    fn registered_format_dword(name: &str) -> Option<u32> {
+        let wide_name = wide(name);
+        let format = unsafe { RegisterClipboardFormatW(wide_name.as_ptr()) };
+        if format == 0 {
+            return None;
+        }
+        let _guard = ClipboardGuard::open()?;
+        let handle = unsafe { GetClipboardData(format) };
+        if handle.is_null() {
+            return None;
+        }
+        let locked = unsafe { GlobalLock(handle) };
+        if locked.is_null() {
+            return None;
+        }
+        let value = unsafe { std::ptr::read_volatile(locked as *const u32) };
+        unsafe { GlobalUnlock(handle) };
+        Some(value)
+    }
+
+    /// Pure decision core of `clipboard_marked_sensitive`, kept separate so the value
+    /// semantics of the history flag stay pinned by unit tests.
+    fn sensitive_marker_decision(presence: &[bool], history_flag: Option<u32>) -> bool {
+        presence.iter().any(|flag| *flag) || history_flag == Some(0)
     }
 
     pub fn set_auto_launch(enabled: bool) -> bool {
@@ -442,7 +528,15 @@ mod imp {
 
     impl ClipboardGuard {
         fn open() -> Option<Self> {
-            (unsafe { OpenClipboard(null_mut()) } != 0).then_some(Self)
+            for attempt in 0..OPEN_CLIPBOARD_ATTEMPTS {
+                if unsafe { OpenClipboard(null_mut()) } != 0 {
+                    return Some(Self);
+                }
+                if attempt + 1 < OPEN_CLIPBOARD_ATTEMPTS {
+                    thread::sleep(OPEN_CLIPBOARD_RETRY_DELAY);
+                }
+            }
+            None
         }
     }
 
@@ -557,6 +651,29 @@ mod imp {
         }
 
         #[test]
+        fn sensitive_marker_decision_respects_history_flag_value_semantics() {
+            // History flag of 0 opts out; non-zero is an explicit opt-in and must not skip.
+            assert!(sensitive_marker_decision(&[false, false], Some(0)));
+            assert!(!sensitive_marker_decision(&[false, false], Some(1)));
+            assert!(!sensitive_marker_decision(&[false, false], None));
+            // Presence-only markers always opt out, regardless of the history flag.
+            assert!(sensitive_marker_decision(&[true, false], Some(1)));
+            assert!(sensitive_marker_decision(&[false, true], None));
+            assert!(!sensitive_marker_decision(&[false, false, false], Some(u32::MAX)));
+        }
+
+        #[test]
+        fn owner_name_rejects_uwp_broker_and_missing_values() {
+            assert_eq!(
+                usable_owner_name(Some("msedge.exe".to_string())).as_deref(),
+                Some("msedge.exe")
+            );
+            assert_eq!(usable_owner_name(Some("RuntimeBroker.exe".to_string())), None);
+            assert_eq!(usable_owner_name(Some("runtimebroker.exe".to_string())), None);
+            assert_eq!(usable_owner_name(None), None);
+        }
+
+        #[test]
         fn open_url_rejects_schemes_that_could_launch_arbitrary_targets() {
             fn allowed(url: &str) -> bool {
                 is_allowed_external_url(url)
@@ -590,7 +707,19 @@ mod imp {
     pub fn foreground_exe() -> Option<String> {
         None
     }
-    pub fn has_sensitive_marker() -> bool {
+    pub fn clipboard_owner_exe() -> Option<String> {
+        None
+    }
+    pub fn clipboard_has_files() -> bool {
+        false
+    }
+    pub fn clipboard_has_text() -> bool {
+        false
+    }
+    pub fn clipboard_has_image() -> bool {
+        false
+    }
+    pub fn clipboard_marked_sensitive() -> bool {
         false
     }
     pub fn set_auto_launch(_enabled: bool) -> bool {
