@@ -29,18 +29,19 @@ npm run selftest:system-clipboard
 
 该测试覆盖 HTML、图片和 `CF_HDROP` 文件列表从系统剪贴板进入加密历史、再写回系统剪贴板的完整 Rust 链路。
 
-## updater 密钥（暂不启用）
+## updater 签名
 
-当前发布流程暂不生成 updater 签名文件，也不要求 GitHub 配置 updater 密钥。
-推送 `app-v<version>` tag 后，工作流直接构建未签名的 x64/ARM64 NSIS 和便携版 ZIP。
+GitHub Actions 使用 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets 生成 updater 签名。
+推送 `app-v<version>` tag 后，工作流构建 x64/ARM64 NSIS 和便携版 ZIP，并上传安装包 `.sig`、更新清单 `latest.json` 与 `SHA256SUMS.txt`。
+主程序内置 updater 公钥，发布前必须校验两种架构的清单和签名。
 
 ## Windows Authenticode 证书（暂不启用）
 
 当前公开发布暂不配置 Windows Authenticode 证书，因此 EXE/NSIS 安装包可能触发 SmartScreen
-提示，也不会生成 updater 签名文件。
+提示；这与独立的 updater 签名无关，更新验证仍然启用。
 后续如果配置 PFX 或 Azure Artifact Signing，再把 Authenticode 签名步骤加入发布工作流。
 
-普通 `main` 推送会在全新的 `windows-11-arm` 原生 ARM64 runner 上运行 Rust 测试、构建未签名
+普通 `main` 推送会在全新的 x64 与 `windows-11-arm` 原生 ARM64 runner 上运行 Rust 测试与系统剪贴板 E2E；ARM64 会构建未签名
 ARM64 NSIS，并静默安装后启动 8 秒做 smoke test；产物只作为 CI artifact，不得公开发行。
 
 x64/ARM64 矩阵故意设为 `max-parallel: 1`。`tauri-action` 对 `latest.json` 采用读取、合并、删除、

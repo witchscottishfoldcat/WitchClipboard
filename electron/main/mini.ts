@@ -197,6 +197,10 @@ export function miniHiddenRecently(within = 400): boolean {
  */
 export function toggleMiniFromTray(anchor?: AnchorRect): void {
   if (miniHiddenRecently()) return
+  toggleMini(anchor)
+}
+
+export function toggleMini(anchor?: AnchorRect): void {
   if (mini?.isVisible()) hideMini()
   else showMini(anchor)
 }

@@ -51,6 +51,12 @@ const THEMES: [Settings['theme'], string, typeof Monitor][] = [
 
 const ITEM_LIMITS = [500, 2000, 10000, 0]
 const DAY_LIMITS = [7, 30, 90, 0]
+const SIZE_LIMITS: Array<[number, string]> = [
+  [1024 * 1024, '1 MB'],
+  [20 * 1024 * 1024, '20 MB'],
+  [100 * 1024 * 1024, '100 MB'],
+  [0, '不限'],
+]
 const MAX_VISIBLE_FILTERS = 5
 const QUICK_MODIFIERS = [
   ['Ctrl', 'Ctrl'],
@@ -428,6 +434,8 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
             <div className="text-[11px] text-black/45 dark:text-white/45">行为</div>
             {(
               [
+                ['hotkeyOpensMini', '主快捷键打开迷你面板', PanelTop],
+                ['preserveFocusOnShow', '呼出时保留原窗口焦点', Monitor],
                 ['trayOpensMini', '单击托盘弹迷你预览面板', PanelTop],
                 ['hideAfterPaste', '粘贴后收起面板', ClipboardPaste],
                 ['skipSensitive', '跳过密码管理器的复制', EyeOff],
@@ -439,12 +447,23 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
                 {text}
                 <input
                   type="checkbox"
-                  checked={Boolean(settings?.[key])}
+                  checked={key === 'trayOpensMini' && settings?.hotkeyOpensMini ? false : Boolean(settings?.[key])}
+                  disabled={key === 'trayOpensMini' && settings?.hotkeyOpensMini}
                   onChange={(e) => void patch({ [key]: e.target.checked })}
-                  className="ml-auto size-3.5 accent-[var(--color-brand-500)]"
+                  className="ml-auto size-3.5 accent-[var(--color-brand-500)] disabled:opacity-40"
                 />
               </label>
             ))}
+            {settings?.hotkeyOpensMini && (
+              <p className="px-1 text-[10.5px] leading-4 text-black/45 dark:text-white/45">
+                主快捷键用于快速粘贴，单击托盘打开完整面板。
+              </p>
+            )}
+            {settings?.preserveFocusOnShow && (
+              <p className="px-1 text-[10.5px] leading-4 text-black/45 dark:text-white/45">
+                键盘输入继续留给原应用；点击面板后可搜索、用方向键选择或按回车粘贴。
+              </p>
+            )}
           </section>
 
           {/* 顶部快速筛选 */}
@@ -513,6 +532,20 @@ export function SettingsSheet({ onClose, onCleared, onToast }: Props) {
                     className={segBtn(settings?.maxDays === v)}
                   >
                     {label(v, '天')}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="mb-1 text-[10.5px] text-black/40 dark:text-white/40">单条大小上限</div>
+              <div className="flex gap-0.5 rounded-lg bg-black/5 p-0.5 dark:bg-white/8">
+                {SIZE_LIMITS.map(([v, name]) => (
+                  <button
+                    key={name}
+                    onClick={() => void patch({ maxItemBytes: v })}
+                    className={segBtn(settings?.maxItemBytes === v)}
+                  >
+                    {name}
                   </button>
                 ))}
               </div>

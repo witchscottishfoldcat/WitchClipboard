@@ -55,6 +55,12 @@ the server never sees your clipboard plaintext.
 | **Encrypted cloud sync** | Sync history through any WebDAV-compatible server; state and images are end-to-end encrypted with AES-256-GCM on the client |
 | **Files & big files** | Only the path is recorded, never the content — copying a 10 GB video library adds one row; pasting yields the real file |
 | **Paste back** | `Enter` switches back to the previous window and simulates `Ctrl+V`; global quick-paste keys paste the top nine items directly |
+| **Item hotkeys** | Bind a global hotkey (e.g. `Ctrl+Alt+0`) to any item and paste it from anywhere; bound items are exempt from auto cleanup |
+| **Nested groups** | Groups support nesting; selecting a parent includes its children — organize frequently used clips like a snippet library |
+| **Multi-select paste** | Ctrl-click / Shift-click several items and paste them all in order at once |
+| **Paste transforms** | Paste as plain text / UPPERCASE / lowercase / Capitalize / Sentence case / camelCase / trimmed |
+| **Notes** | Attach a searchable note to any item — write down what that obscure command is for |
+| **Import / export** | Export history to a JSON archive, drop it back to import (deduplicated by hash) — handy for backup or migration |
 | **Organize** | Pin (never auto-cleaned), tags, filter by type/tag, full keyboard control |
 | **Themes & accents** | System / light / dark themes, seven accent colors applied to every button |
 | **Local encryption** | SQLCipher database + AES-256-GCM images, keys protected by OS secure storage |
@@ -108,9 +114,11 @@ Windows x64 is the primary supported platform; Windows ARM64 is an experimental 
 | Double-click tray icon | Open the full panel directly |
 | Right-click tray icon | Mini panel / full panel / collapse all / quit |
 | `Alt+V` | Toggle the full panel (global, remappable in settings) |
+| `Alt+M` | Toggle the mini panel (global) |
 | Just type | Search |
 | `↑` `↓` / `PgUp` `PgDn` / `Home` `End` | Move the selection |
-| `Enter` | Paste the selected item into the window you just left |
+| `Enter` | Paste the selected item into the window you just left; with a multi-selection, paste all of them in order |
+| Ctrl+Click / Shift+Click | Add to / range-select a multi-selection |
 | `Ctrl+Alt+1…9` | Globally paste the top 9 items in any window; modifiers remappable in settings, digits `1…9` fixed |
 | `Ctrl+C` | Copy to the clipboard only, no paste |
 | `Ctrl+P` | Pin / unpin |
@@ -119,6 +127,10 @@ Windows x64 is the primary supported platform; Windows ARM64 is an experimental 
 | `Esc` | Clear the search first, then collapse the panel |
 
 ## Two panels
+
+Enable “Open mini panel with main hotkey” under Settings → Behavior to make the main hotkey (default `Alt+V`) open the mini panel and a single tray click open the full panel. Turning it off restores the previous tray preference.
+
+“Keep the original window focused when showing” is off by default. When enabled, keyboard input stays in the original app until you click the panel to search, navigate or press Enter. Double-clicking an item pastes it; clicking outside hides the panel.
 
 - **Mini preview panel** (click the tray): 280×390, shows roughly the last 8 items in one screen. Text shows
   its first line, images a thumbnail, files name + size + folder. Typing searches instantly, `↑↓` selects,
@@ -155,6 +167,7 @@ also syncs in the background every 5 minutes.
 - History state, tags, deletion records and images are all encrypted on this machine with AES-256-GCM before upload over HTTPS
 - Every image blob is encrypted and SHA-256 verified individually; remote file names derive from the sync key and leak no content hash; concurrent writes use ETag conditional requests to detect conflicts and retry automatically
 - WebDAV credentials and the sync key are encrypted again on disk with the master key; the public config API only returns "is set" and a key fingerprint
+- Notes, tags, pins, hotkeys and groups merge using a separate metadata revision, including explicit clears. Missing fields from older clients preserve local values; editing metadata in both directions requires all devices to support metadata revisions
 - Deletions propagate between devices via tombstones; newer re-copies can explicitly restore content
 - The server still sees a fixed directory name, ciphertext sizes, file counts and access times, but never content, tags or source apps
 
@@ -254,9 +267,13 @@ scripts/     Performance benchmarks, system-clipboard E2E and icon maintenance s
 
 ### A few key trade-offs
 
-- **Clipboard listening**: Rust polls Win32 `GetClipboardSequenceNumber` to detect changes. That call is
-  dirt cheap, so 400ms polling costs almost no CPU while idle — no decoding clipboard content every tick.
-  Falls back to content-fingerprint comparison when the native API is unavailable.
+- **Clipboard listening** is event-driven: a message-only window registers with
+  `AddClipboardFormatListener` and reads only when `WM_CLIPBOARDUPDATE` arrives — zero cost while idle.
+  `GetClipboardSequenceNumber` is used for deduplication and recognizing our own writes; reads wait for
+  the event stream to go quiet for 100 ms (writers often set content and exclusion flags in separate
+  steps), and failed reads retry briefly so a momentarily busy clipboard never loses an entry. A
+  watchdog verifies the event loop every 5 minutes and rebuilds the listener if it silently dies
+  (e.g. after a remote desktop reconnect).
 - **Search** uses FTS5 with the `trigram` tokenizer. The default `unicode61` can't split Chinese, so Chinese
   substrings were unfindable; trigram can, but its minimum is 3 characters, so 1–2 character keywords fall
   back to an escaped `LIKE` scan.

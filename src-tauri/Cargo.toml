@@ -1,6 +1,6 @@
 [package]
 name = "witch-clipboard"
-version = "1.8.0"
+version = "1.9.0"
 description = "Local-first clipboard manager with encrypted history"
 authors = ["Thewitchcat"]
 edition = "2021"
@@ -30,6 +30,10 @@ tauri-plugin-updater = "2.10"
 thiserror = "2"
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", default-features = false, features = [
+  "Win32_System_Com",
+  "Win32_UI_Accessibility",
+] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_NetworkManagement_IpHelper",

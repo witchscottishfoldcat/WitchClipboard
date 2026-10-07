@@ -99,6 +99,12 @@ export default function App() {
     return api.onChanged(reloadGroups)
   }, [reloadGroups])
 
+  useEffect(() => {
+    if (groupId !== null && groupId !== 0 && !groups.some((group) => group.id === groupId)) {
+      setGroupId(null)
+    }
+  }, [groups, groupId])
+
   // 后台热键粘贴失败时给可见提示（面板隐藏时事件无害）
   useEffect(
     () =>
@@ -408,6 +414,9 @@ export default function App() {
         onGroup={setGroupId}
         onCreateGroup={(name, parentId) => {
           void api.groupCreate(name, parentId).then(() => reloadGroups())
+        }}
+        onRenameGroup={(id, name) => {
+          void api.groupRename(id, name).then(() => reloadGroups())
         }}
         onDeleteGroup={(id) => {
           void api.groupDelete(id).then(() => {

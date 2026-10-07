@@ -6,7 +6,9 @@
  * 所以再加一个看门狗，直接问系统「现在前台窗口是谁家的」。
  */
 import type { BrowserWindow } from 'electron'
-import { foregroundPid, forceForeground } from './win32'
+import { screen } from 'electron'
+import { foregroundPid, forceForeground, leftMouseButtonDown } from './win32'
+import { getSettings } from './settings'
 
 const POLL_MS = 200
 /** 刚显示的这段时间不判定，等焦点交接完成 */
@@ -21,6 +23,10 @@ export function autoHideDisabled(): boolean {
 
 /** 显示窗口后调用：尽量把它抢到前台，blur 才会可靠 */
 export function claimForeground(win: BrowserWindow): void {
+  if (getSettings().preserveFocusOnShow) {
+    win.showInactive()
+    return
+  }
   win.show()
   win.focus()
   if (disabled) return
@@ -35,6 +41,7 @@ export function claimForeground(win: BrowserWindow): void {
 export interface DismissTarget {
   isDestroyed(): boolean
   isVisible(): boolean
+  getBounds?(): { x: number; y: number; width: number; height: number }
 }
 
 export interface WatchOptions {
@@ -58,7 +65,8 @@ export function watchOutsideClick(
 ): () => void {
   if (disabled && !options.force) return () => {}
 
-  const pollMs = options.pollMs ?? POLL_MS
+  const preserveFocus = getSettings().preserveFocusOnShow
+  const pollMs = options.pollMs ?? (preserveFocus ? 25 : POLL_MS)
   const graceMs = options.graceMs ?? GRACE_MS
   const getPid = options.getPid ?? foregroundPid
   const selfPid = options.selfPid ?? process.pid
@@ -69,11 +77,26 @@ export function watchOutsideClick(
    * 否则「一直没抢到焦点」会被误判成「用户点了别处」，面板会自己莫名消失。
    */
   let sawSelfForeground = false
+  let wasMouseDown = leftMouseButtonDown()
 
   const timer = setInterval(() => {
     if (win.isDestroyed() || !win.isVisible()) {
       clearInterval(timer)
       return
+    }
+
+    const mouseDown = leftMouseButtonDown()
+    const clicked = mouseDown && !wasMouseDown
+    wasMouseDown = mouseDown
+    if (preserveFocus && clicked && win.getBounds) {
+      const bounds = win.getBounds()
+      const cursor = screen.getCursorScreenPoint()
+      if (cursor.x < bounds.x || cursor.x >= bounds.x + bounds.width
+        || cursor.y < bounds.y || cursor.y >= bounds.y + bounds.height) {
+        clearInterval(timer)
+        hide()
+        return
+      }
     }
 
     const pid = getPid()

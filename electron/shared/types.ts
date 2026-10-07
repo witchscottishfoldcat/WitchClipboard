@@ -118,12 +118,18 @@ export interface Settings {
   maxItems: number
   /** 最多保留天数，0 = 不限 */
   maxDays: number
+  /** 单条入库大小上限（字节），0 = 不限；文件条目只记录路径不受限 */
+  maxItemBytes: number
   /** 跳过带「不要记录」标记的剪贴板，以及来自 sensitiveApps 的复制 */
   skipSensitive: boolean
   /** 敏感来源进程名片段，命中即不入库 */
   sensitiveApps: string[]
   /** 粘贴后自动隐藏面板 */
   hideAfterPaste: boolean
+  /** 主快捷键呼出迷你面板，托盘单击改为完整面板。 */
+  hotkeyOpensMini: boolean
+  /** 呼出时保留原应用焦点，点击面板后再使用键盘操作。 */
+  preserveFocusOnShow: boolean
   /** 单击托盘弹迷你预览面板（false = 直接开完整面板） */
   trayOpensMini: boolean
   /** 顶部导航栏显示的快速筛选标签；all 始终显示 */

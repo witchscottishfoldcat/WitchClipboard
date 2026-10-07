@@ -19,6 +19,7 @@ interface Props {
   activeGroupId: number | null
   onGroup: (id: number | null) => void
   onCreateGroup: (name: string, parentId: number | null) => void
+  onRenameGroup: (id: number, name: string) => void
   onDeleteGroup: (id: number) => void
 }
 
@@ -43,9 +44,11 @@ export function FilterBar({
   activeGroupId,
   onGroup,
   onCreateGroup,
+  onRenameGroup,
   onDeleteGroup,
 }: Props) {
   const [creating, setCreating] = useState(false)
+  const [renamingId, setRenamingId] = useState<number | null>(null)
   const [draft, setDraft] = useState('')
   const depthOf = (group: Group, guard = 0): number => {
     if (!group.parentId || guard > 8) return 0
@@ -57,6 +60,12 @@ export function FilterBar({
     if (name) onCreateGroup(name, activeGroupId && activeGroupId > 0 ? activeGroupId : null)
     setDraft('')
     setCreating(false)
+  }
+  const commitRename = (): void => {
+    const name = draft.trim()
+    if (name && renamingId !== null) onRenameGroup(renamingId, name)
+    setDraft('')
+    setRenamingId(null)
   }
 
   return (
@@ -94,11 +103,37 @@ export function FilterBar({
             activeGroupId === group.id ? chipOn : chipOff
           }`}
         >
-          <button type="button" onClick={() => onGroup(activeGroupId === group.id ? null : group.id)}>
-            {'\u00A0'.repeat(depthOf(group) * 2)}
-            {group.name}
-            <span className="ml-1 opacity-60 tabular-nums">{group.count}</span>
-          </button>
+          {renamingId === group.id ? (
+            <input
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commitRename}
+              onKeyDown={(e) => {
+                e.stopPropagation()
+                if (e.key === 'Enter') commitRename()
+                else if (e.key === 'Escape') {
+                  setDraft('')
+                  setRenamingId(null)
+                }
+              }}
+              className="h-5 w-24 rounded border border-brand-500/60 bg-white/70 px-1 text-[11px] outline-none dark:bg-white/10 dark:text-white/85"
+            />
+          ) : (
+            <button
+              type="button"
+              onClick={() => onGroup(activeGroupId === group.id ? null : group.id)}
+              onDoubleClick={() => {
+                setDraft(group.name)
+                setRenamingId(group.id)
+              }}
+              title="单击筛选 · 双击重命名"
+            >
+              {'\u00A0'.repeat(depthOf(group) * 2)}
+              {group.name}
+              <span className="ml-1 opacity-60 tabular-nums">{group.count}</span>
+            </button>
+          )}
           <button
             type="button"
             title="删除分组（条目回到未分组）"

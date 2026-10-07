@@ -26,7 +26,8 @@ export function createTray(): Tray {
   // toggle 函数内部自带「刚被失焦收起」的冷却判断
   tray.on('click', (_event, bounds) => {
     const anchor = pickAnchor(bounds)
-    if (getSettings().trayOpensMini) toggleMiniFromTray(anchor)
+    const settings = getSettings()
+    if (!settings.hotkeyOpensMini && settings.trayOpensMini) toggleMiniFromTray(anchor)
     else toggleFromTray(anchor)
   })
 

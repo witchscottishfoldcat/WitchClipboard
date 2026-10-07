@@ -5607,7 +5607,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "witch-clipboard"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "aes-gcm",
  "arboard",
@@ -5630,6 +5630,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "thiserror 2.0.19",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

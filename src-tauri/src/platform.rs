@@ -11,7 +11,7 @@ mod imp {
     };
 
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, GlobalFree, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{CloseHandle, GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
         System::{
             DataExchange::{
@@ -35,18 +35,23 @@ mod imp {
             HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
-                KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, VK_CONTROL, VK_LBUTTON,
-                VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+                KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, VK_CONTROL, VK_ESCAPE,
+                VK_LBUTTON, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
             },
             Shell::{DragQueryFileW, ShellExecuteW},
             WindowsAndMessaging::{
-                BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, IsIconic, MessageBoxW,
-                PostMessageW, PrivateExtractIconsW, RegisterClassW, SendMessageW,
-                SetForegroundWindow, ShowWindow, SystemParametersInfoW, TranslateMessage,
-                HICON, HWND_MESSAGE, ICON_BIG, ICON_SMALL, MB_ICONERROR, MB_OK, MSG, SM_CXICON,
-                SM_CXSMICON, SPI_GETFOREGROUNDLOCKTIMEOUT, SPI_SETFOREGROUNDLOCKTIMEOUT,
-                SW_RESTORE, SW_SHOWNORMAL, WM_CLIPBOARDUPDATE, WM_QUIT, WM_SETICON, WNDCLASSW,
+                BringWindowToTop, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
+                DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow,
+                GetGUIThreadInfo, GetMessageW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+                IsWindow, IsWindowVisible, MessageBoxW, PostMessageW, PrivateExtractIconsW,
+                RegisterClassW, SendMessageTimeoutW, SendMessageW, SetForegroundWindow,
+                SetWindowPos, SetWindowsHookExW, ShowWindow, SystemParametersInfoW,
+                TranslateMessage, UnhookWindowsHookEx, GUITHREADINFO, HICON, HWND_MESSAGE,
+                HWND_TOPMOST, ICON_BIG, ICON_SMALL, MB_ICONERROR, MB_OK, MSG, MSLLHOOKSTRUCT,
+                SMTO_ABORTIFHUNG, SM_CXICON, SM_CXSMICON, SPI_GETFOREGROUNDLOCKTIMEOUT,
+                SPI_SETFOREGROUNDLOCKTIMEOUT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WH_MOUSE_LL, WM_CANCELMODE,
+                WM_CLIPBOARDUPDATE, WM_LBUTTONDOWN, WM_QUIT, WM_RBUTTONDOWN, WM_SETICON, WNDCLASSW,
             },
         },
     };
@@ -82,6 +87,7 @@ mod imp {
     // passed through WM_SETICON, so destroying them while a window is alive would leave it with
     // dangling icons. The OS reclaims both handles when the process exits.
     static WINDOW_ICONS: OnceLock<Mutex<HashMap<(i32, i32), (isize, isize)>>> = OnceLock::new();
+    static MOUSE_CLICKS: Mutex<Option<mpsc::Sender<(i32, i32, i64)>>> = Mutex::new(None);
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(Some(0)).collect()
@@ -283,6 +289,55 @@ mod imp {
         unsafe { (GetAsyncKeyState(VK_LBUTTON as i32) & i16::MIN) != 0 }
     }
 
+    unsafe extern "system" fn mouse_click_proc(
+        code: i32,
+        message: WPARAM,
+        data: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 && matches!(message as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN) {
+            let event = unsafe { &*(data as *const MSLLHOOKSTRUCT) };
+            if let Ok(sender) = MOUSE_CLICKS.lock() {
+                if let Some(sender) = sender.as_ref() {
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    let _ = sender.send((event.pt.x, event.pt.y, at));
+                }
+            }
+        }
+        unsafe { CallNextHookEx(null_mut(), code, message, data) }
+    }
+
+    pub fn start_mouse_click_notifications() -> Result<mpsc::Receiver<(i32, i32, i64)>, String> {
+        let (sender, receiver) = mpsc::channel();
+        *MOUSE_CLICKS.lock().map_err(|error| error.to_string())? = Some(sender);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || unsafe {
+            let hook = SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(mouse_click_proc),
+                GetModuleHandleW(null()),
+                0,
+            );
+            if hook.is_null() {
+                let _ = ready_sender.send(Err(std::io::Error::last_os_error().to_string()));
+                return;
+            }
+            let _ = ready_sender.send(Ok(()));
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            UnhookWindowsHookEx(hook);
+        });
+        ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| error.to_string())??;
+        Ok(receiver)
+    }
+
     pub fn start_clipboard_notifications() -> Result<mpsc::Receiver<()>, String> {
         let (event_sender, event_receiver) = mpsc::channel();
         {
@@ -424,6 +479,28 @@ mod imp {
             unsafe { GlobalFree(memory) };
             return false;
         }
+        // Ask system-level listeners (clipboard history, cloud sync) to skip this update:
+        // the probe carries no user content and must not reshuffle Win+V history every
+        // five minutes. The user's content was recorded when it was first copied.
+        let exclude_name = wide("ExcludeClipboardContentFromMonitorProcessing");
+        let exclude_format = unsafe { RegisterClipboardFormatW(exclude_name.as_ptr()) };
+        if exclude_format != 0 {
+            let flag = unsafe { GlobalAlloc(GMEM_MOVEABLE, 4) };
+            if !flag.is_null() {
+                let locked = unsafe { GlobalLock(flag) };
+                if !locked.is_null() {
+                    unsafe {
+                        std::ptr::write_volatile(locked as *mut u32, 0);
+                        GlobalUnlock(flag);
+                    }
+                    if unsafe { SetClipboardData(exclude_format, flag as *mut c_void) }.is_null() {
+                        unsafe { GlobalFree(flag) };
+                    }
+                } else {
+                    unsafe { GlobalFree(flag) };
+                }
+            }
+        }
         true
     }
 
@@ -434,6 +511,74 @@ mod imp {
     pub fn foreground_window() -> Option<isize> {
         let hwnd = unsafe { GetForegroundWindow() };
         (!hwnd.is_null()).then_some(hwnd as isize)
+    }
+
+    pub fn is_paste_target(hwnd: isize) -> bool {
+        let window = hwnd as HWND;
+        if hwnd == 0
+            || unsafe { IsWindow(window) == 0 || IsWindowVisible(window) == 0 }
+            || window_process_id(hwnd).is_none_or(|pid| pid == std::process::id())
+        {
+            return false;
+        }
+        let mut class = [0u16; 256];
+        let length = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
+        length > 0
+            && !matches!(
+                String::from_utf16_lossy(&class[..length as usize]).as_str(),
+                "Shell_TrayWnd"
+                    | "Shell_SecondaryTrayWnd"
+                    | "NotifyIconOverflowWindow"
+                    | "Progman"
+                    | "WorkerW"
+            )
+    }
+
+    pub fn show_panel(window: &tauri::WebviewWindow, preserve_focus: bool) -> Result<(), String> {
+        if !preserve_focus {
+            window.show().map_err(|error| error.to_string())?;
+            return window.set_focus().map_err(|error| error.to_string());
+        }
+        let hwnd = window.hwnd().map_err(|error| error.to_string())?.0 as HWND;
+        // Showing a window with SW_SHOW activates it even without a subsequent focus call.
+        if unsafe {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+
+    pub fn mouse_position() -> Option<(i32, i32)> {
+        let mut point = POINT::default();
+        (unsafe { GetCursorPos(&mut point) != 0 }).then_some((point.x, point.y))
+    }
+
+    pub fn hide_panel(window: &tauri::WebviewWindow) {
+        let _ = window.hide();
+        // Native inactive-show does not update Tao's cached visibility flags, so its
+        // hide request can be a no-op. Keep the real HWND hidden in both show modes.
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe { ShowWindow(hwnd.0 as HWND, SW_HIDE) };
+        }
+    }
+
+    pub fn point_inside_window(window: &tauri::WebviewWindow, point: (i32, i32)) -> bool {
+        let Ok(hwnd) = window.hwnd() else { return true };
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd.0 as HWND, &mut rect) == 0 } {
+            return true;
+        }
+        point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
     }
 
     pub fn window_process_id(hwnd: isize) -> Option<u32> {
@@ -507,7 +652,9 @@ mod imp {
     }
 
     pub fn clipboard_has_image() -> bool {
-        unsafe { IsClipboardFormatAvailable(CF_DIBV5) != 0 || IsClipboardFormatAvailable(CF_DIB) != 0 }
+        unsafe {
+            IsClipboardFormatAvailable(CF_DIBV5) != 0 || IsClipboardFormatAvailable(CF_DIB) != 0
+        }
     }
 
     pub fn clipboard_marked_sensitive() -> bool {
@@ -592,7 +739,7 @@ mod imp {
     }
 
     pub fn restore_and_paste(target: isize) -> Result<(), &'static str> {
-        if target == 0 {
+        if !is_paste_target(target) {
             return Err("no-target");
         }
         let target = target as HWND;
@@ -619,21 +766,160 @@ mod imp {
         unsafe {
             for key in [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL] {
                 if (GetAsyncKeyState(key as i32) & i16::MIN) != 0 {
-                    send_key_event(key, KEYEVENTF_KEYUP);
+                    if !send_key_event(key, KEYEVENTF_KEYUP) {
+                        return Err("send-failed");
+                    }
                 }
             }
-            send_key_event(VK_CONTROL, 0);
-            send_key_event(VK_V as u16, 0);
-            send_key_event(VK_V as u16, KEYEVENTF_KEYUP);
-            send_key_event(VK_CONTROL, KEYEVENTF_KEYUP);
+        }
+        cancel_target_menu(target)?;
+        if unsafe { GetForegroundWindow() != target } {
+            return Err("focus-failed");
+        }
+        let inputs = [
+            keyboard_input(VK_CONTROL, 0),
+            keyboard_input(VK_V as u16, 0),
+            keyboard_input(VK_V as u16, KEYEVENTF_KEYUP),
+            keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
+        ];
+        if unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            )
+        } != inputs.len() as u32
+        {
+            // A partial insertion must not leave Control or V held down.
+            let _ = send_key_event(VK_V as u16, KEYEVENTF_KEYUP);
+            let _ = send_key_event(VK_CONTROL, KEYEVENTF_KEYUP);
+            return Err("send-failed");
         }
         Ok(())
+    }
+
+    fn cancel_target_menu(target: HWND) -> Result<(), &'static str> {
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let target_thread = unsafe { GetWindowThreadProcessId(target, null_mut()) };
+        // Cancel menu/capture modes without dismissing a dialog or changing the caret.
+        if unsafe { GetGUIThreadInfo(target_thread, &mut info) } != 0 {
+            for window in [target, info.hwndFocus, info.hwndMenuOwner] {
+                if !window.is_null() {
+                    unsafe {
+                        SendMessageTimeoutW(
+                            window,
+                            WM_CANCELMODE,
+                            0,
+                            0,
+                            SMTO_ABORTIFHUNG,
+                            100,
+                            null_mut(),
+                        )
+                    };
+                }
+            }
+        }
+        cancel_custom_menu(target)
+    }
+
+    fn cancel_custom_menu(target: HWND) -> Result<(), &'static str> {
+        use windows::Win32::{
+            System::Com::{
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+                COINIT_MULTITHREADED,
+            },
+            UI::Accessibility::{CUIAutomation8, IUIAutomation2},
+        };
+        // Modern access-key menus are not represented by GUITHREADINFO. Inspect only
+        // control types in the target process; never send Escape to an ordinary dialog.
+        if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
+            return Ok(());
+        }
+        struct Apartment;
+        impl Drop for Apartment {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+        let _apartment = Apartment;
+        let Ok(automation) = (unsafe {
+            CoCreateInstance::<_, IUIAutomation2>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+        }) else {
+            return Ok(());
+        };
+        if unsafe {
+            automation
+                .SetConnectionTimeout(200)
+                .and_then(|_| automation.SetTransactionTimeout(200))
+        }
+        .is_err()
+        {
+            return Ok(());
+        }
+        let Some(pid) = window_process_id(target as isize) else {
+            return Err("no-target");
+        };
+        for _ in 0..3 {
+            if unsafe { GetForegroundWindow() != target } {
+                return Err("focus-failed");
+            }
+            if !focused_menu(&automation, pid).unwrap_or(false) {
+                return Ok(());
+            }
+            if !send_key_event(VK_ESCAPE, 0) || !send_key_event(VK_ESCAPE, KEYEVENTF_KEYUP) {
+                let _ = send_key_event(VK_ESCAPE, KEYEVENTF_KEYUP);
+                return Err("send-failed");
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        if focused_menu(&automation, pid).unwrap_or(false) {
+            Err("focus-failed")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn focused_menu(
+        automation: &windows::Win32::UI::Accessibility::IUIAutomation2,
+        pid: u32,
+    ) -> windows::core::Result<bool> {
+        use windows::Win32::UI::Accessibility::{
+            UIA_MenuBarControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId,
+            UIA_WindowControlTypeId,
+        };
+        unsafe {
+            let mut element = automation.GetFocusedElement()?;
+            let walker = automation.ControlViewWalker()?;
+            for _ in 0..6 {
+                if element.CurrentProcessId()? != pid as i32 {
+                    return Ok(false);
+                }
+                let kind = element.CurrentControlType()?;
+                if kind == UIA_MenuBarControlTypeId
+                    || kind == UIA_MenuControlTypeId
+                    || kind == UIA_MenuItemControlTypeId
+                {
+                    return Ok(true);
+                }
+                if kind == UIA_WindowControlTypeId {
+                    break;
+                }
+                element = walker.GetParentElement(&element)?;
+            }
+        }
+        Ok(false)
     }
 
     /// Force `target` into the foreground and wait for the activation to actually complete;
     /// `SetForegroundWindow` alone is regularly refused when the caller does not own the
     /// foreground (a panel that never received focus, background paste paths).
     fn activate_target(target: HWND) -> bool {
+        if unsafe { GetForegroundWindow() == target } {
+            return true;
+        }
         unsafe {
             // Neutralize the foreground lock timeout for the duration of the switch, then
             // restore the user's original value.
@@ -664,7 +950,7 @@ mod imp {
                 std::ptr::null_mut(),
                 0,
             );
-            if !requested {
+            if !requested && GetForegroundWindow() != target {
                 return false;
             }
         }
@@ -701,9 +987,7 @@ mod imp {
             if opened == 0 || token.is_null() {
                 return false;
             }
-            let mut elevation = TOKEN_ELEVATION {
-                TokenIsElevated: 0,
-            };
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
             let mut returned = 0u32;
             let ok = GetTokenInformation(
                 token,
@@ -720,7 +1004,7 @@ mod imp {
     /// Inject one keystroke via SendInput, preferring scan codes: applications that read
     /// hardware scan codes (some terminals, nested remote sessions) ignore virtual-key
     /// events. Keys without a base scan code fall back to the virtual-key path.
-    fn send_key_event(vk: u16, flags: u32) {
+    fn keyboard_input(vk: u16, flags: u32) -> INPUT {
         let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
         let mut input: INPUT = unsafe { std::mem::zeroed() };
         input.r#type = INPUT_KEYBOARD;
@@ -741,7 +1025,12 @@ mod imp {
                 dwExtraInfo: 0,
             }
         };
-        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+        input
+    }
+
+    fn send_key_event(vk: u16, flags: u32) -> bool {
+        let input = keyboard_input(vk, flags);
+        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 }
     }
 
     struct ClipboardGuard;
@@ -860,6 +1149,30 @@ mod imp {
         use super::*;
 
         #[test]
+        fn missing_windows_and_shell_cannot_be_paste_targets() {
+            use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+            assert!(!is_paste_target(0));
+            assert!(!is_paste_target(isize::MAX));
+            assert_eq!(restore_and_paste(0), Err("no-target"));
+            for class in [
+                "Shell_TrayWnd",
+                "Shell_SecondaryTrayWnd",
+                "NotifyIconOverflowWindow",
+                "Progman",
+                "WorkerW",
+            ] {
+                let name = wide(class);
+                let window = unsafe { FindWindowW(name.as_ptr(), null()) };
+                if !window.is_null() {
+                    assert!(
+                        !is_paste_target(window as isize),
+                        "{class} must not receive paste"
+                    );
+                }
+            }
+        }
+
+        #[test]
         fn dropfiles_payload_has_wide_flag_and_double_null_terminator() {
             let payload = dropfiles_payload(&[
                 "C:\\alpha.txt".to_string(),
@@ -879,7 +1192,10 @@ mod imp {
             // Presence-only markers always opt out, regardless of the history flag.
             assert!(sensitive_marker_decision(&[true, false], Some(1)));
             assert!(sensitive_marker_decision(&[false, true], None));
-            assert!(!sensitive_marker_decision(&[false, false, false], Some(u32::MAX)));
+            assert!(!sensitive_marker_decision(
+                &[false, false, false],
+                Some(u32::MAX)
+            ));
         }
 
         #[test]
@@ -888,8 +1204,14 @@ mod imp {
                 usable_owner_name(Some("msedge.exe".to_string())).as_deref(),
                 Some("msedge.exe")
             );
-            assert_eq!(usable_owner_name(Some("RuntimeBroker.exe".to_string())), None);
-            assert_eq!(usable_owner_name(Some("runtimebroker.exe".to_string())), None);
+            assert_eq!(
+                usable_owner_name(Some("RuntimeBroker.exe".to_string())),
+                None
+            );
+            assert_eq!(
+                usable_owner_name(Some("runtimebroker.exe".to_string())),
+                None
+            );
             assert_eq!(usable_owner_name(None), None);
         }
 
@@ -924,6 +1246,28 @@ mod imp {
     }
     pub fn foreground_window() -> Option<isize> {
         None
+    }
+    pub fn is_paste_target(_hwnd: isize) -> bool {
+        false
+    }
+    pub fn start_mouse_click_notifications() -> Result<mpsc::Receiver<(i32, i32, i64)>, String> {
+        Err("native mouse notifications are only available on Windows".to_string())
+    }
+    pub fn mouse_position() -> Option<(i32, i32)> {
+        None
+    }
+    pub fn hide_panel(window: &tauri::WebviewWindow) {
+        let _ = window.hide();
+    }
+    pub fn point_inside_window(_window: &tauri::WebviewWindow, _point: (i32, i32)) -> bool {
+        true
+    }
+    pub fn show_panel(window: &tauri::WebviewWindow, preserve_focus: bool) -> Result<(), String> {
+        window.show().map_err(|error| error.to_string())?;
+        if !preserve_focus {
+            window.set_focus().map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
     pub fn window_process_id(_hwnd: isize) -> Option<u32> {
         None

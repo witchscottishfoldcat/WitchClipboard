@@ -1,4 +1,4 @@
-import { useEffect, useState, type KeyboardEvent } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import {
   ClipboardPaste,
@@ -94,6 +94,32 @@ function HotkeySetter({
       <Keyboard className="size-3" />
       {current ?? '热键'}
     </button>
+  )
+}
+
+function NoteEditor({ note, onCommit }: { note: string | null; onCommit: (note: string | null) => void }) {
+  const [draft, setDraft] = useState(note ?? '')
+  const previous = useRef(note ?? '')
+  useEffect(() => {
+    const old = previous.current
+    previous.current = note ?? ''
+    // Update a clean editor after sync without discarding an unsaved local draft.
+    setDraft((current) => current === old ? note ?? '' : current)
+  }, [note])
+  return (
+    <textarea
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+      placeholder="备注（可搜索）…"
+      rows={2}
+      onKeyDown={(event) => { if (event.key !== 'Escape') event.stopPropagation() }}
+      onBlur={() => {
+        const value = draft.trim()
+        setDraft(value)
+        if (value !== (note ?? '')) onCommit(value || null)
+      }}
+      className="w-full resize-none rounded-lg border border-black/8 bg-black/[0.025] px-2 py-1.5 text-[11.5px] leading-4 text-black/70 outline-none transition focus:border-brand-500/50 dark:border-white/10 dark:bg-white/[0.045] dark:text-white/72"
+    />
   )
 }
 
@@ -401,20 +427,10 @@ export function PreviewPane({
 
           {/* 备注：自由文本，纳入全文搜索 */}
           <div className="px-3.5 pt-2.5">
-            <textarea
+            <NoteEditor
               key={item.id}
-              defaultValue={item.note ?? ''}
-              placeholder="备注（可搜索）…"
-              rows={2}
-              onKeyDown={(e) => {
-                // 备注>里打字不应触发列表导航；Escape 保持原有「收起」语义
-                if (e.key !== 'Escape') e.stopPropagation()
-              }}
-              onBlur={(e) => {
-                const value = e.target.value.trim()
-                if (value !== (item.note ?? '')) onSetNote(item.id, value || null)
-              }}
-              className="w-full resize-none rounded-lg border border-black/8 bg-black/[0.025] px-2 py-1.5 text-[11.5px] leading-4 text-black/70 outline-none transition focus:border-brand-500/50 dark:border-white/10 dark:bg-white/[0.045] dark:text-white/72"
+              note={item.note ?? null}
+              onCommit={(note) => onSetNote(item.id, note)}
             />
           </div>
 

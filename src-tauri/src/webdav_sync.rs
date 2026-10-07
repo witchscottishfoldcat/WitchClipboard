@@ -196,7 +196,11 @@ impl WebDavSync {
         validate_config(&config)?;
         let client = Client::builder()
             .timeout(Duration::from_secs(45))
-            .user_agent(concat!("Witch-Clipboard/", env!("CARGO_PKG_VERSION"), " WebDAV-E2EE"))
+            .user_agent(concat!(
+                "Witch-Clipboard/",
+                env!("CARGO_PKG_VERSION"),
+                " WebDAV-E2EE"
+            ))
             .build()
             .map_err(|error| error.to_string())?;
         ensure_collection(&client, &config, remote_root(&config))?;
@@ -690,13 +694,13 @@ mod tests {
 
     #[test]
     fn two_clients_sync_through_ciphertext_only_webdav_state() {
-        let (url, encrypted_state, server) = mock_webdav(8);
+        let (url, encrypted_state, server) = mock_webdav(24);
         let sync_key = crypto::generate_sync_key();
         let first_directory = tempfile::tempdir().unwrap();
         let first_store = SqliteStore::open(first_directory.path()).unwrap();
         let secret = "cloud secret that must not reach WebDAV in plaintext";
         let hash = format!("{:x}", Sha256::digest(secret.as_bytes()));
-        first_store
+        let (first_id, _) = first_store
             .add(NewItem {
                 kind: "text".into(),
                 text: Some(secret.into()),
@@ -753,6 +757,33 @@ mod tests {
         assert_eq!(status.downloaded, 1);
         let history = second_store.list(&ListQuery::default()).unwrap();
         assert_eq!(history.items[0].text.as_deref(), Some(secret));
+        let second_id = history.items[0].id;
+        first_store
+            .set_item_note(first_id, Some("cloud note"))
+            .unwrap();
+        first_store
+            .set_tags(first_id, &["cloud tag".into()])
+            .unwrap();
+        first_store.toggle_pin(first_id).unwrap();
+        first_store
+            .set_item_hotkey(first_id, Some("Ctrl+Alt+0"))
+            .unwrap();
+        first_sync.sync_now(&first_store).unwrap();
+        second_sync.sync_now(&second_store).unwrap();
+        let updated = second_store.get(second_id).unwrap().unwrap();
+        assert_eq!(updated.note.as_deref(), Some("cloud note"));
+        assert_eq!(updated.tags, ["cloud tag"]);
+        assert!(updated.pinned);
+        assert_eq!(updated.hotkey.as_deref(), Some("Ctrl+Alt+0"));
+        first_store.set_item_note(first_id, None).unwrap();
+        first_store.set_item_hotkey(first_id, None).unwrap();
+        first_store.set_tags(first_id, &[]).unwrap();
+        first_store.toggle_pin(first_id).unwrap();
+        first_sync.sync_now(&first_store).unwrap();
+        second_sync.sync_now(&second_store).unwrap();
+        let cleared = second_store.get(second_id).unwrap().unwrap();
+        assert!(cleared.note.is_none() && cleared.hotkey.is_none());
+        assert!(cleared.tags.is_empty() && !cleared.pinned);
         server.join().unwrap();
     }
 
@@ -778,6 +809,11 @@ mod tests {
                 use_count: 0,
                 created_at: 1,
                 last_used_at: 1,
+                metadata_updated_at: 0,
+                metadata_revision: String::new(),
+                note: None.into(),
+                hotkey: None.into(),
+                group_path: None.into(),
             }],
             ..Snapshot::default()
         };

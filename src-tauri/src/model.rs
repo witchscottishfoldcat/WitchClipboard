@@ -23,6 +23,10 @@ pub struct ClipItem {
     pub note: Option<String>,
     pub hotkey: Option<String>,
     pub group_id: Option<i64>,
+    #[serde(skip)]
+    pub metadata_updated_at: i64,
+    #[serde(skip)]
+    pub metadata_revision: String,
 }
 
 /// 分组树节点；count 只统计直接挂在节点上的条目（不含子分组）。
@@ -58,7 +62,9 @@ pub fn apply_paste_transform(text: &str, transform: PasteTransform) -> String {
             .map(|word| {
                 let mut chars = word.chars();
                 match chars.next() {
-                    Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                    }
                     None => String::new(),
                 }
             })
@@ -136,6 +142,48 @@ pub struct PasteOutcome {
     pub reason: Option<&'static str>,
 }
 
+/// A missing field preserves the local value; an explicit null clears it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SyncField {
+    #[default]
+    Missing,
+    Value(Option<String>),
+}
+
+impl SyncField {
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    pub fn as_deref(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::Value(value) => value.as_deref(),
+        }
+    }
+}
+
+impl From<Option<String>> for SyncField {
+    fn from(value: Option<String>) -> Self {
+        Self::Value(value)
+    }
+}
+
+impl Serialize for SyncField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Missing => serializer.serialize_none(),
+            Self::Value(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SyncField {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<String>::deserialize(deserializer).map(Self::Value)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncItem {
@@ -156,6 +204,18 @@ pub struct SyncItem {
     pub use_count: u32,
     pub created_at: i64,
     pub last_used_at: i64,
+    /// Metadata edits have their own clock; equal clocks use the revision as a total order.
+    #[serde(default)]
+    pub metadata_updated_at: i64,
+    #[serde(default)]
+    pub metadata_revision: String,
+    #[serde(default, skip_serializing_if = "SyncField::is_missing")]
+    pub note: SyncField,
+    #[serde(default, skip_serializing_if = "SyncField::is_missing")]
+    pub hotkey: SyncField,
+    /// Group IDs are local, so only the path is shared.
+    #[serde(default, skip_serializing_if = "SyncField::is_missing")]
+    pub group_path: SyncField,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -178,6 +238,10 @@ pub struct Settings {
     pub skip_sensitive: bool,
     pub sensitive_apps: Vec<String>,
     pub hide_after_paste: bool,
+    #[serde(default)]
+    pub hotkey_opens_mini: bool,
+    #[serde(default)]
+    pub preserve_focus_on_show: bool,
     pub tray_opens_mini: bool,
     pub visible_filters: Vec<String>,
     pub auto_launch: bool,
@@ -210,6 +274,8 @@ impl Default for Settings {
             .map(str::to_string)
             .collect(),
             hide_after_paste: true,
+            hotkey_opens_mini: false,
+            preserve_focus_on_show: false,
             tray_opens_mini: true,
             visible_filters: ["all", "text", "image", "files", "url", "key"]
                 .into_iter()

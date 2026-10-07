@@ -308,6 +308,14 @@ export function foregroundPid(): number | null {
   }
 }
 
+export function leftMouseButtonDown(): boolean {
+  try {
+    return native !== null && (native.GetAsyncKeyState(0x01) & 0x8000) !== 0
+  } catch {
+    return false
+  }
+}
+
 /** 用 Electron 给的原生句柄强行抢前台，配合 win.focus() 提高成功率 */
 export function forceForeground(handle: Buffer): boolean {
   if (!native) return false

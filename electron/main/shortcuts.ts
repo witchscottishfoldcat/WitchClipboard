@@ -1,5 +1,6 @@
 import { globalShortcut } from 'electron'
 import { togglePanel } from './window'
+import { toggleMini } from './mini'
 import { getSettings } from './settings'
 
 let current: string | null = null
@@ -15,7 +16,10 @@ export function registerHotkey(accelerator = getSettings().hotkey): boolean {
   if (current === accelerator && globalShortcut.isRegistered(accelerator)) return true
 
   try {
-    const ok = globalShortcut.register(accelerator, togglePanel)
+    const ok = globalShortcut.register(accelerator, () => {
+      if (getSettings().hotkeyOpensMini) toggleMini()
+      else togglePanel()
+    })
     if (!ok) {
       console.error(`[hotkey] 注册失败，可能已被占用: ${accelerator}`)
       return false

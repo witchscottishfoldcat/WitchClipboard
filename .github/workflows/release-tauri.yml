@@ -45,7 +45,7 @@ jobs:
           releaseDraft: true
           generateReleaseNotes: true
           updaterJsonPreferNsis: true
-          # Public release is intentionally unsigned for now.
+          # Updater artifacts are signed; Windows Authenticode is not configured.
           args: --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
       - name: Build portable package
         shell: pwsh

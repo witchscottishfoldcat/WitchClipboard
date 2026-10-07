@@ -27,6 +27,8 @@ jobs:
         run: npm run typecheck
       - name: Rust tests
         run: npm run selftest
+      - name: System clipboard pipeline E2E
+        run: npm run selftest:system-clipboard
       - name: Build frontend
         run: npm run build:tauri:web
 
@@ -45,6 +47,8 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Run Rust tests natively on ARM64
         run: npm run selftest
+      - name: System clipboard pipeline E2E on ARM64
+        run: npm run selftest:system-clipboard
       - name: Build unsigned ARM64 NSIS on a clean ARM64 runner
         run: npx tauri build --ci --no-sign --bundles nsis --target aarch64-pc-windows-msvc
       - name: Install and launch ARM64 package

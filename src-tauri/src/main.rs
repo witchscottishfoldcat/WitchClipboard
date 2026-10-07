@@ -54,6 +54,8 @@ struct AppState {
     settings: SettingsStore,
     clipboard_gate: Mutex<()>,
     target_hwnd: AtomicIsize,
+    last_external_hwnd: AtomicIsize,
+    panel_shown_at: AtomicI64,
     own_clipboard_sequence: AtomicU32,
     main_shortcut_id: AtomicU32,
     main_window_creating: AtomicBool,
@@ -83,6 +85,8 @@ impl AppState {
             settings: SettingsStore::load(&data_dir),
             clipboard_gate: Mutex::new(()),
             target_hwnd: AtomicIsize::new(0),
+            last_external_hwnd: AtomicIsize::new(0),
+            panel_shown_at: AtomicI64::new(0),
             own_clipboard_sequence: AtomicU32::new(0),
             main_shortcut_id: AtomicU32::new(0),
             main_window_creating: AtomicBool::new(false),
@@ -483,41 +487,39 @@ fn probe_clipboard(state: &AppState) -> bool {
 fn monitor_clipboard(app: AppHandle, state: Arc<AppState>, notifications: mpsc::Receiver<()>) {
     let mut last_sequence = platform::clipboard_sequence();
     while wait_for_clipboard_settle(&notifications, || {
-        state.last_clipboard_event_at.store(epoch_ms(), Ordering::Release);
+        state
+            .last_clipboard_event_at
+            .store(epoch_ms(), Ordering::Release);
     }) {
         // Own writes hold this gate until their sequence number is published. This removes
         // the race where WM_CLIPBOARDUPDATE can arrive before the writer marks it ignored.
         // 临界区只覆盖序列号比对与剪贴板读取；PNG 编码、哈希、入库都移出锁外，
         // 否则复制大截图时快粘键路径会被编码耗时阻塞。
-        let capture = read_with_retries(
-            CLIPBOARD_READ_RETRIES,
-            CLIPBOARD_READ_RETRY_DELAY,
-            || {
-                let _clipboard_guard = state
-                    .clipboard_gate
-                    .lock()
-                    .expect("clipboard gate lock poisoned");
-                let sequence = platform::clipboard_sequence();
-                if sequence == last_sequence
-                    || sequence == state.own_clipboard_sequence.load(Ordering::Acquire)
-                {
-                    return ReadAttempt::Skip;
+        let capture = read_with_retries(CLIPBOARD_READ_RETRIES, CLIPBOARD_READ_RETRY_DELAY, || {
+            let _clipboard_guard = state
+                .clipboard_gate
+                .lock()
+                .expect("clipboard gate lock poisoned");
+            let sequence = platform::clipboard_sequence();
+            if sequence == last_sequence
+                || sequence == state.own_clipboard_sequence.load(Ordering::Acquire)
+            {
+                return ReadAttempt::Skip;
+            }
+            // The sequence number is consumed only once the outcome is decided;
+            // leaving it untouched on Transient is what lets the retry re-read.
+            match read_clipboard_update(&state) {
+                ReadAttempt::Captured(capture) => {
+                    last_sequence = sequence;
+                    ReadAttempt::Captured(capture)
                 }
-                // The sequence number is consumed only once the outcome is decided;
-                // leaving it untouched on Transient is what lets the retry re-read.
-                match read_clipboard_update(&state) {
-                    ReadAttempt::Captured(capture) => {
-                        last_sequence = sequence;
-                        ReadAttempt::Captured(capture)
-                    }
-                    ReadAttempt::Skip => {
-                        last_sequence = sequence;
-                        ReadAttempt::Skip
-                    }
-                    ReadAttempt::Transient => ReadAttempt::Transient,
+                ReadAttempt::Skip => {
+                    last_sequence = sequence;
+                    ReadAttempt::Skip
                 }
-            },
-        );
+                ReadAttempt::Transient => ReadAttempt::Transient,
+            }
+        });
         let Some(capture) = capture else {
             continue;
         };
@@ -536,13 +538,73 @@ fn epoch_ms() -> i64 {
 
 fn remember_paste_target(app: &AppHandle) {
     let state = app.state::<Arc<AppState>>();
-    if let Some(hwnd) = platform::foreground_window() {
-        let belongs_to_this_process =
-            platform::window_process_id(hwnd).is_some_and(|pid| pid == std::process::id());
-        if !belongs_to_this_process {
-            state.target_hwnd.store(hwnd, Ordering::Release);
-        }
+    let foreground = platform::foreground_window();
+    // Switching between our own panels must retain the original target. Tray clicks
+    // can temporarily foreground the shell, so use the most recent application then.
+    if foreground.is_some_and(|hwnd| {
+        platform::window_process_id(hwnd).is_some_and(|pid| pid == std::process::id())
+    }) {
+        return;
     }
+    let target = foreground
+        .filter(|hwnd| platform::is_paste_target(*hwnd))
+        .or_else(|| {
+            let hwnd = state.last_external_hwnd.load(Ordering::Acquire);
+            platform::is_paste_target(hwnd).then_some(hwnd)
+        })
+        .unwrap_or(0);
+    state.target_hwnd.store(target, Ordering::Release);
+}
+
+fn start_window_watchdog(app: &AppHandle, state: &Arc<AppState>) {
+    let app = app.clone();
+    let state = state.clone();
+    thread::spawn(move || {
+        let clicks = platform::start_mouse_click_notifications()
+            .map_err(|error| {
+                eprintln!("failed to watch outside clicks: {error}");
+            })
+            .ok();
+        let mut was_down = platform::left_mouse_button_down();
+        loop {
+            if let Some(hwnd) =
+                platform::foreground_window().filter(|hwnd| platform::is_paste_target(*hwnd))
+            {
+                state.last_external_hwnd.store(hwnd, Ordering::Release);
+            }
+            let down = platform::left_mouse_button_down();
+            // Drain even when inactive; stale clicks must not hide a newly shown panel.
+            let points: Vec<_> = if let Some(clicks) = &clicks {
+                clicks.try_iter().collect()
+            } else if down && !was_down {
+                platform::mouse_position()
+                    .map(|point| (point.0, point.1, epoch_ms()))
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !points.is_empty()
+                && state.settings.get().preserve_focus_on_show
+                && std::env::var_os("WCC_NO_AUTOHIDE").is_none()
+            {
+                for label in ["main", "mini"] {
+                    if let Some(window) = app.get_webview_window(label) {
+                        if window.is_visible().unwrap_or(false)
+                            && points.iter().any(|point| {
+                                point.2 > state.panel_shown_at.load(Ordering::Acquire)
+                                    && !platform::point_inside_window(&window, (point.0, point.1))
+                            })
+                        {
+                            hide_window(&window);
+                        }
+                    }
+                }
+            }
+            was_down = down;
+            thread::sleep(Duration::from_millis(25));
+        }
+    });
 }
 
 fn hide_window(window: &WebviewWindow) {
@@ -594,7 +656,7 @@ fn hide_window(window: &WebviewWindow) {
             }
         }
     });
-    let _ = window.hide();
+    platform::hide_panel(window);
 }
 
 fn watch_panel_window(window: &WebviewWindow) {
@@ -681,8 +743,17 @@ fn show_existing_window(app: &AppHandle, label: &str, tray_rect: Option<&Rect>) 
             position_mini_near_tray(&window, tray_rect);
         }
     }
-    let _ = window.show();
-    let _ = window.set_focus();
+    let preserve_focus = app
+        .state::<Arc<AppState>>()
+        .settings
+        .get()
+        .preserve_focus_on_show;
+    app.state::<Arc<AppState>>()
+        .panel_shown_at
+        .store(epoch_ms(), Ordering::Release);
+    if let Err(error) = platform::show_panel(&window, preserve_focus) {
+        eprintln!("failed to show panel: {error}");
+    }
     if let Err(error) = platform::set_window_icons(&window) {
         eprintln!("failed to set window icons: {error}");
     }
@@ -711,6 +782,7 @@ fn show_mini_window(app: &AppHandle, tray_rect: Option<Rect>) {
         .resizable(false)
         .skip_taskbar(true)
         .always_on_top(true)
+        .focused(false)
         .visible(false)
         .build();
         match built {
@@ -755,6 +827,7 @@ fn show_main_window(app: &AppHandle) {
                 .resizable(true)
                 .skip_taskbar(true)
                 .always_on_top(true)
+                .focused(false)
                 .visible(false)
                 .build();
         match built {
@@ -864,7 +937,8 @@ fn toggle_tray_window(app: &AppHandle, tray_rect: Option<Rect>) {
     if epoch_ms() - state.hidden_at.load(Ordering::Acquire) < 400 {
         return;
     }
-    let label = if state.settings.get().tray_opens_mini {
+    let settings = state.settings.get();
+    let label = if !settings.hotkey_opens_mini && settings.tray_opens_mini {
         "mini"
     } else {
         "main"
@@ -952,7 +1026,11 @@ fn register_shortcuts(
 fn handle_shortcut(app: &AppHandle, shortcut: &Shortcut) {
     let state = app.state::<Arc<AppState>>();
     if shortcut.id() == state.main_shortcut_id.load(Ordering::Acquire) {
-        toggle_main_window(app);
+        if state.settings.get().hotkey_opens_mini {
+            toggle_mini_window(app);
+        } else {
+            toggle_main_window(app);
+        }
         return;
     }
     if let Ok(mini) = MINI_HOTKEY.parse::<Shortcut>() {
@@ -962,17 +1040,25 @@ fn handle_shortcut(app: &AppHandle, shortcut: &Shortcut) {
         }
     }
     // 快粘与条目热键共用「以当前前台窗口为粘贴目标」的语义。
-    if let Some(hwnd) = platform::foreground_window() {
-        if !platform::window_process_id(hwnd).is_some_and(|pid| pid == std::process::id()) {
-            state.target_hwnd.store(hwnd, Ordering::Release);
-        }
-    }
+    remember_paste_target(app);
     if let Some(item_id) = state
         .item_hotkeys
         .lock()
         .ok()
         .and_then(|map| map.get(&shortcut.id()).copied())
     {
+        // A sync or failed registration can briefly leave a stale runtime mapping.
+        // Never paste a different item while that mapping is being reconciled.
+        let current = state
+            .store
+            .get(item_id)
+            .ok()
+            .flatten()
+            .and_then(|item| item.hotkey)
+            .and_then(|hotkey| hotkey.parse::<Shortcut>().ok());
+        if current.is_none_or(|current| current.id() != shortcut.id()) {
+            return;
+        }
         paste_item_by_id_in_background(app, &state, item_id);
         return;
     }
@@ -1037,6 +1123,8 @@ struct ExportItem {
     hash: String,
     pinned: bool,
     note: Option<String>,
+    /// 分组以路径形式归档（与同步协议一致）；分组 id 在不同库间不可比
+    group_path: Option<String>,
     created_at: i64,
     source_app: Option<String>,
     width: Option<u32>,
@@ -1057,6 +1145,66 @@ struct ExportFile {
     items: Vec<ExportItem>,
 }
 
+fn validate_import(payload: ExportFile) -> Result<Vec<(ExportItem, Option<Vec<u8>>)>, String> {
+    if payload.format != "witch-clipboard-export" || payload.version != 1 {
+        return Err("unsupported format or version".to_string());
+    }
+    payload
+        .items
+        .into_iter()
+        .map(|entry| {
+            if !storage::is_content_hash(&entry.hash) {
+                return Err("invalid content hash".to_string());
+            }
+            let (hash, png) = match entry.kind.as_str() {
+                "text" if entry.image_png.is_none() => {
+                    let text = entry
+                        .text
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                        .ok_or_else(|| "invalid text item".to_string())?;
+                    (text_hash(text), None)
+                }
+                "files" if entry.image_png.is_none() => {
+                    let paths = entry
+                        .text
+                        .as_deref()
+                        .filter(|text| !text.is_empty())
+                        .ok_or_else(|| "invalid file item".to_string())?;
+                    (
+                        text_hash(&format!("files:{}", paths.replace('\n', "\0"))),
+                        None,
+                    )
+                }
+                "image" => {
+                    let encoded = entry
+                        .image_png
+                        .as_deref()
+                        .ok_or_else(|| "missing image".to_string())?;
+                    let png = BASE64.decode(encoded).map_err(|error| error.to_string())?;
+                    image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                        .map_err(|error| format!("invalid image: {error}"))?;
+                    (text_hash_bytes(&png), Some(png))
+                }
+                _ => return Err("invalid item kind".to_string()),
+            };
+            if entry.hash != hash {
+                return Err("content hash mismatch".to_string());
+            }
+            Ok((entry, png))
+        })
+        .collect()
+}
+
+/// Batch writes can fail after changing some rows; the views must still reload.
+struct ChangeNotification<'a>(&'a AppHandle);
+
+impl Drop for ChangeNotification<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.emit("witchcat://changed", ());
+    }
+}
+
 #[tauri::command]
 fn groups_list(state: State<'_, Arc<AppState>>) -> Result<Vec<Group>, String> {
     state.store.groups().map_err(|e| e.to_string())
@@ -1064,27 +1212,39 @@ fn groups_list(state: State<'_, Arc<AppState>>) -> Result<Vec<Group>, String> {
 
 #[tauri::command]
 fn group_create(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     name: String,
     parent_id: Option<i64>,
 ) -> Result<i64, String> {
-    state
+    let id = state
         .store
         .group_create(&name, parent_id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("witchcat://changed", ());
+    Ok(id)
 }
 
 #[tauri::command]
-fn group_rename(state: State<'_, Arc<AppState>>, id: i64, name: String) -> Result<(), String> {
+fn group_rename(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    name: String,
+) -> Result<(), String> {
     state
         .store
         .group_rename(id, &name)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("witchcat://changed", ());
+    Ok(())
 }
 
 #[tauri::command]
-fn group_delete(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    state.store.group_delete(id).map_err(|e| e.to_string())
+fn group_delete(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    state.store.group_delete(id).map_err(|e| e.to_string())?;
+    let _ = app.emit("witchcat://changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1104,6 +1264,7 @@ fn item_set_group(
 
 #[tauri::command]
 fn set_item_note(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     id: i64,
     note: Option<String>,
@@ -1111,7 +1272,9 @@ fn set_item_note(
     state
         .store
         .set_item_note(id, note.as_deref())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("witchcat://changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1147,9 +1310,7 @@ async fn set_item_hotkey(
                 .item_hotkeys()
                 .map_err(|e| e.to_string())?
                 .iter()
-                .any(|(other, assigned)| {
-                    *other != id && assigned.eq_ignore_ascii_case(expression)
-                });
+                .any(|(other, assigned)| *other != id && assigned.eq_ignore_ascii_case(expression));
             if duplicate {
                 return Err("hotkey-conflict".to_string());
             }
@@ -1172,6 +1333,7 @@ async fn set_item_hotkey(
             .store
             .set_item_hotkey(id, clean)
             .map_err(|e| e.to_string())?;
+        let _changed = ChangeNotification(&app);
         // 全量重建，保证注册表与库一致（新分配或清空都覆盖）。允许回退：
         // 重建瞬间主热键若被其他程序抢占，宁可降级到备用键也不能丢掉面板呼出。
         register_shortcuts(&app, &state, true).map_err(|e| e.to_string())?;
@@ -1195,6 +1357,7 @@ async fn paste_items(
                 reason: Some("not-found"),
             });
         }
+        let _changed = ChangeNotification(window.app_handle());
         let hidden = state.settings.get().hide_after_paste;
         if hidden {
             hide_window(&window);
@@ -1250,7 +1413,10 @@ async fn paste_transformed(
             .get(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "not-found".to_string())?;
-        let text = item.text.as_deref().ok_or_else(|| "not-found".to_string())?;
+        let text = item
+            .text
+            .as_deref()
+            .ok_or_else(|| "not-found".to_string())?;
         let transformed = apply_paste_transform(text, transform);
         write_text_to_clipboard(&state, &transformed)?;
         let hidden = state.settings.get().hide_after_paste;
@@ -1296,14 +1462,16 @@ async fn export_items(
                 }
                 collected
             }
-            _ => state
-                .store
-                .list(&ListQuery {
-                    limit: Some(1000),
-                    ..Default::default()
-                })
-                .map_err(|e| e.to_string())?
-                .items,
+            _ => {
+                state
+                    .store
+                    .list(&ListQuery {
+                        limit: Some(1000),
+                        ..Default::default()
+                    })
+                    .map_err(|e| e.to_string())?
+                    .items
+            }
         };
         let mut exported = Vec::with_capacity(items.len());
         for item in items {
@@ -1316,6 +1484,10 @@ async fn export_items(
             } else {
                 None
             };
+            let group_path = state
+                .store
+                .item_group_path(item.group_id)
+                .map_err(|e| e.to_string())?;
             exported.push(ExportItem {
                 kind: item.kind,
                 text: item.text,
@@ -1325,6 +1497,7 @@ async fn export_items(
                 hash: item.hash,
                 pinned: item.pinned,
                 note: item.note,
+                group_path,
                 created_at: item.created_at,
                 source_app: item.source_app,
                 width: item.width,
@@ -1355,28 +1528,29 @@ async fn export_items(
 }
 
 #[tauri::command]
-async fn import_items(state: State<'_, Arc<AppState>>, path: String) -> Result<String, String> {
+async fn import_items(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    path: String,
+) -> Result<String, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let payload: ExportFile =
             serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
-        if payload.format != "witch-clipboard-export" {
-            return Err("unsupported format".to_string());
-        }
+        // Validate the entire archive before the first filesystem or database mutation.
+        let entries = validate_import(payload)?;
+        let _changed = ChangeNotification(&app);
         let mut added = 0usize;
         let mut skipped = 0usize;
-        for entry in payload.items {
-            let blob_name = match entry.image_png.as_deref() {
-                Some(encoded) => {
-                    let png = BASE64.decode(encoded).map_err(|e| e.to_string())?;
-                    Some(
-                        state
-                            .store
-                            .put_blob(&entry.hash, &png)
-                            .map_err(|e| e.to_string())?,
-                    )
-                }
+        for (entry, png) in entries {
+            let blob_name = match png.as_deref() {
+                Some(png) => Some(
+                    state
+                        .store
+                        .put_blob(&entry.hash, png)
+                        .map_err(|e| e.to_string())?,
+                ),
                 None => None,
             };
             let thumb = entry
@@ -1407,10 +1581,30 @@ async fn import_items(state: State<'_, Arc<AppState>>, path: String) -> Result<S
             if inserted {
                 added += 1;
                 if entry.pinned {
-                    let _ = state.store.toggle_pin(id);
+                    state
+                        .store
+                        .toggle_pin(id)
+                        .map_err(|error| error.to_string())?;
                 }
-                if entry.note.as_deref().is_some_and(|note| !note.trim().is_empty()) {
-                    let _ = state.store.set_item_note(id, entry.note.as_deref());
+                if entry
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| !note.trim().is_empty())
+                {
+                    state
+                        .store
+                        .set_item_note(id, entry.note.as_deref())
+                        .map_err(|error| error.to_string())?;
+                }
+                if let Some(path) = entry
+                    .group_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                {
+                    state
+                        .store
+                        .item_set_group_by_path(id, path)
+                        .map_err(|error| error.to_string())?;
                 }
             } else {
                 skipped += 1;
@@ -1428,9 +1622,11 @@ async fn clipboard_list(
     query: ListQuery,
 ) -> Result<ListResult, String> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.store.list(&query).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        state.store.list(&query).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1444,8 +1640,18 @@ fn clipboard_tags(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String
 }
 
 #[tauri::command]
-fn clipboard_set_tags(state: State<'_, Arc<AppState>>, id: i64, tags: Vec<String>) {
-    let _ = state.store.set_tags(id, &tags);
+fn clipboard_set_tags(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    tags: Vec<String>,
+) -> Result<(), String> {
+    state
+        .store
+        .set_tags(id, &tags)
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("witchcat://changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1712,12 +1918,48 @@ fn webdav_status(state: State<'_, Arc<AppState>>) -> webdav_sync::SyncStatus {
 
 #[tauri::command]
 async fn webdav_sync_now(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<webdav_sync::SyncStatus, String> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.webdav.sync_now(&state.store))
+    tauri::async_runtime::spawn_blocking(move || sync_history(&app, &state))
         .await
         .map_err(|error| error.to_string())?
+}
+
+fn sync_history(app: &AppHandle, state: &AppState) -> Result<webdav_sync::SyncStatus, String> {
+    let mut before = state
+        .store
+        .item_hotkeys()
+        .map_err(|error| error.to_string())?;
+    before.sort();
+    let _changed = ChangeNotification(app);
+    let result = state.webdav.sync_now(&state.store);
+    // The download may have changed rows even if a later HTTP request failed.
+    let refreshed = state
+        .store
+        .item_hotkeys()
+        .map_err(|error| error.to_string())
+        .and_then(|mut after| {
+            after.sort();
+            if before != after {
+                register_shortcuts(app, state, true)
+            } else {
+                Ok(())
+            }
+        });
+    match result {
+        Err(error) => {
+            if let Err(refresh_error) = refreshed {
+                eprintln!("shortcut reconciliation failed: {refresh_error}");
+            }
+            Err(error)
+        }
+        Ok(status) => {
+            refreshed?;
+            Ok(status)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1732,17 +1974,27 @@ fn toggle_pin(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Resul
 
 #[tauri::command]
 fn remove_item(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    // 先查热键再删——删除后条目就不在了，注册表只在实际悬挂时才值得全量重建。
+    let had_hotkey = state
+        .store
+        .get(id)
+        .ok()
+        .flatten()
+        .is_some_and(|item| item.hotkey.is_some());
     state.store.remove(id).map_err(|error| error.to_string())?;
     let _ = app.emit("witchcat://changed", ());
-    // 条目可能绑着热键；重建注册表避免悬挂映射（允许回退，理由同 set_item_hotkey）。
-    let owned = state.inner().clone();
-    let _ = register_shortcuts(&app, &owned, true);
+    if had_hotkey {
+        // 允许回退：重建瞬间主热键若被抢占，宁可降级到备用键也不能丢掉面板呼出。
+        let owned = state.inner().clone();
+        let _ = register_shortcuts(&app, &owned, true);
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn clear_all(state: State<'_, Arc<AppState>>) {
-    let _ = state.store.clear_all();
+fn clear_all(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let _changed = ChangeNotification(&app);
+    state.store.clear_all().map_err(|error| error.to_string())
 }
 
 fn write_item(state: &AppState, id: i64) -> Result<(), String> {
@@ -1809,11 +2061,15 @@ fn write_item(state: &AppState, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn copy_item(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+async fn copy_item(app: AppHandle, state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || write_item(&state, id))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        write_item(&state, id)?;
+        let _ = app.emit("witchcat://changed", ());
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1830,6 +2086,8 @@ async fn paste_item(
                 reason: Some("not-found"),
             };
         }
+
+        let _changed = ChangeNotification(window.app_handle());
 
         let hidden = state.settings.get().hide_after_paste;
         if hidden {
@@ -1939,6 +2197,7 @@ fn main() {
         ])
         .setup(move |app| {
             let state = app.state::<Arc<AppState>>().inner().clone();
+            start_window_watchdog(app.handle(), &state);
             register_shortcuts(app.handle(), &state, true).map_err(std::io::Error::other)?;
 
             let show = MenuItem::with_id(app, "show", "显示 / 隐藏", true, None::<&str>)?;
@@ -2025,6 +2284,7 @@ fn main() {
                 });
             }
             let sync_state = state.clone();
+            let sync_app = app.handle().clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(30));
                 loop {
@@ -2033,7 +2293,9 @@ fn main() {
                         .config()
                         .is_ok_and(|config| config.enabled)
                     {
-                        let _ = sync_state.webdav.sync_now(&sync_state.store);
+                        if let Err(error) = sync_history(&sync_app, &sync_state) {
+                            eprintln!("background sync failed: {error}");
+                        }
                     }
                     thread::sleep(Duration::from_secs(5 * 60));
                 }
@@ -2048,7 +2310,10 @@ fn main() {
             // 退出整个进程——会把后台仍在服务的跨设备 HTTP 服务一并杀掉。这里只拦这种
             // "无主"退出（code 为 None）；托盘退出（exit(0)）与重启（request_restart）携带
             // code，照常放行。系统关机不走此事件，不受影响。
-            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = event {
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = event
+            {
                 api.prevent_exit();
             }
         });
@@ -2066,6 +2331,8 @@ mod tests {
             settings: SettingsStore::load(path),
             clipboard_gate: Mutex::new(()),
             target_hwnd: AtomicIsize::new(0),
+            last_external_hwnd: AtomicIsize::new(0),
+            panel_shown_at: AtomicI64::new(0),
             own_clipboard_sequence: AtomicU32::new(0),
             main_shortcut_id: AtomicU32::new(0),
             main_window_creating: AtomicBool::new(false),
@@ -2083,6 +2350,76 @@ mod tests {
             webdav,
             phone_events: Mutex::new(None),
         }
+    }
+
+    fn export_fixture(text: &str) -> ExportItem {
+        serde_json::from_value(serde_json::json!({
+            "kind": "text", "text": text, "preview": text, "autoKind": "plain",
+            "hash": text_hash(text), "pinned": false, "createdAt": 1, "bytes": text.len()
+        }))
+        .unwrap()
+    }
+
+    fn archive_fixture(items: Vec<ExportItem>) -> ExportFile {
+        ExportFile {
+            format: "witch-clipboard-export".into(),
+            version: 1,
+            exported_at: 1,
+            items,
+        }
+    }
+
+    #[test]
+    fn import_validation_rejects_bad_hash_kind_image_and_version() {
+        for hash in [
+            "中",
+            "../../outside",
+            "C:\\outside",
+            &"A".repeat(64),
+            &"a".repeat(64),
+        ] {
+            let mut entry = export_fixture("content");
+            entry.hash = hash.to_string();
+            assert!(validate_import(archive_fixture(vec![entry])).is_err());
+        }
+        let mut entry = export_fixture("content");
+        entry.kind = "unknown".into();
+        assert!(validate_import(archive_fixture(vec![entry])).is_err());
+        let mut entry = export_fixture("content");
+        entry.kind = "image".into();
+        entry.image_png = Some(BASE64.encode(b"not a PNG"));
+        assert!(validate_import(archive_fixture(vec![entry])).is_err());
+        let mut archive = archive_fixture(vec![export_fixture("content")]);
+        archive.version = 2;
+        assert!(validate_import(archive).is_err());
+        let mut invalid_last = export_fixture("last");
+        invalid_last.hash = "中".into();
+        assert!(validate_import(archive_fixture(vec![
+            export_fixture("valid first"),
+            invalid_last
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn import_validation_accepts_exported_text_files_and_png_hashes() {
+        let text = export_fixture("content");
+        let mut files = export_fixture("C:\\one.txt\nC:\\two.png");
+        files.kind = "files".into();
+        files.hash = text_hash("files:C:\\one.txt\0C:\\two.png");
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut image = export_fixture("image");
+        image.kind = "image".into();
+        image.text = None;
+        image.hash = text_hash_bytes(&png);
+        image.image_png = Some(BASE64.encode(&png));
+        let entries = validate_import(archive_fixture(vec![text, files, image])).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].1.is_none() && entries[1].1.is_none());
+        assert_eq!(entries[2].1.as_deref(), Some(png.as_slice()));
     }
 
     #[test]
@@ -2139,11 +2476,10 @@ mod tests {
     #[test]
     fn read_with_retries_drops_after_exhausting_retries() {
         let mut calls = 0u32;
-        let value: Option<String> =
-            read_with_retries(2, Duration::ZERO, || {
-                calls += 1;
-                ReadAttempt::Transient
-            });
+        let value: Option<String> = read_with_retries(2, Duration::ZERO, || {
+            calls += 1;
+            ReadAttempt::Transient
+        });
         assert_eq!(value, None);
         assert_eq!(calls, 3); // initial attempt plus two retries
     }
@@ -2205,7 +2541,12 @@ mod tests {
             None,
             Some("tester.exe".to_string())
         ));
-        assert!(state.store.list(&ListQuery::default()).unwrap().items.is_empty());
+        assert!(state
+            .store
+            .list(&ListQuery::default())
+            .unwrap()
+            .items
+            .is_empty());
 
         assert!(insert_text(
             &state,
@@ -2213,7 +2554,10 @@ mod tests {
             None,
             Some("tester.exe".to_string())
         ));
-        assert_eq!(state.store.list(&ListQuery::default()).unwrap().items.len(), 1);
+        assert_eq!(
+            state.store.list(&ListQuery::default()).unwrap().items.len(),
+            1
+        );
     }
 
     #[test]

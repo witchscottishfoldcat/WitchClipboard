@@ -99,6 +99,35 @@ mod tests {
         assert_eq!(settings.visible_filters, ["all", "url"]);
         assert_eq!(settings.accent, "violet");
         assert_eq!(settings.opacity, 90);
+        assert!(!settings.hotkey_opens_mini);
+        assert!(!settings.preserve_focus_on_show);
+    }
+
+    #[test]
+    fn panel_preferences_survive_save_and_restart_without_changing_existing_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("settings.json"),
+            r#"{"hotkey":"Ctrl+Space","trayOpensMini":true,"maxItems":500}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::load(directory.path());
+        let saved = store
+            .save_patch(serde_json::json!({
+                "hotkeyOpensMini": true, "preserveFocusOnShow": true
+            }))
+            .unwrap();
+        let reloaded = SettingsStore::load(directory.path()).get();
+        assert!(saved.hotkey_opens_mini && reloaded.hotkey_opens_mini);
+        assert!(reloaded.preserve_focus_on_show);
+        assert_eq!(reloaded.hotkey, "Ctrl+Space");
+        assert_eq!(reloaded.max_items, 500);
+        assert!(reloaded.tray_opens_mini);
+        let restored = store
+            .save_patch(serde_json::json!({"hotkeyOpensMini":false,"preserveFocusOnShow":false}))
+            .unwrap();
+        assert!(!restored.hotkey_opens_mini && !restored.preserve_focus_on_show);
+        assert!(restored.tray_opens_mini);
     }
 
     #[test]

@@ -8,6 +8,7 @@ const DEFAULTS: Settings = {
   quickPasteModifiers: 'Ctrl+Alt',
   maxItems: 2000,
   maxDays: 30,
+  maxItemBytes: 20 * 1024 * 1024,
   skipSensitive: true,
   // 常见密码管理器：命中进程名就不入库
   sensitiveApps: [
@@ -21,6 +22,8 @@ const DEFAULTS: Settings = {
     'nordpass',
   ],
   hideAfterPaste: true,
+  hotkeyOpensMini: false,
+  preserveFocusOnShow: false,
   trayOpensMini: true,
   visibleFilters: ['all', 'text', 'image', 'files', 'url', 'key'],
   autoLaunch: false,
